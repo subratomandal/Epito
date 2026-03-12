@@ -1,0 +1,9 @@
+import { NextResponse } from 'next/server';
+import * as db from '@/lib/database';
+
+export const dynamic = 'force-dynamic';
+
+export async function GET() {
+  const images = db.getAllImages();
+  return NextResponse.json(images);
+}

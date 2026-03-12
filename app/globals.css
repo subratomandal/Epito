@@ -1,0 +1,161 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 0 0% 100%;
+    --foreground: 240 10% 3.9%;
+    --card: 0 0% 100%;
+    --card-foreground: 240 10% 3.9%;
+    --muted: 240 4.8% 95.9%;
+    --muted-foreground: 240 3.8% 46.1%;
+    --accent: 240 4.8% 95.9%;
+    --accent-foreground: 240 5.9% 10%;
+    --border: 240 5.9% 90%;
+    --input: 240 5.9% 90%;
+    --ring: 240 5.9% 10%;
+    --primary: 221 83% 53%;
+    --primary-foreground: 0 0% 100%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 0 0% 98%;
+  }
+
+  .dark {
+    --background: 240 10% 3.9%;
+    --foreground: 0 0% 98%;
+    --card: 240 10% 3.9%;
+    --card-foreground: 0 0% 98%;
+    --muted: 240 3.7% 15.9%;
+    --muted-foreground: 240 5% 64.9%;
+    --accent: 240 3.7% 15.9%;
+    --accent-foreground: 0 0% 98%;
+    --border: 240 3.7% 15.9%;
+    --input: 240 3.7% 15.9%;
+    --ring: 240 4.9% 83.9%;
+    --primary: 221 83% 53%;
+    --primary-foreground: 0 0% 100%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 0 0% 98%;
+  }
+
+  * { @apply border-border; }
+  body { @apply bg-background text-foreground; }
+  html, body { overscroll-behavior: none; }
+}
+
+/* Mobile: prevent text zoom on input focus */
+@media (max-width: 767px) {
+  input, textarea, select { font-size: 16px !important; }
+  .tiptap { font-size: 15px !important; min-height: 150px; }
+  .tiptap h1 { font-size: 1.5rem !important; }
+  .tiptap h2 { font-size: 1.25rem !important; }
+  .tiptap h3 { font-size: 1.1rem !important; }
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: hsl(var(--muted-foreground) / 0.3); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: hsl(var(--muted-foreground) / 0.5); }
+::selection { background: rgba(59, 130, 246, 0.3); }
+
+/* TipTap Editor */
+.tiptap { @apply outline-none min-h-[200px] leading-relaxed; font-size: var(--editor-font-size, 16px); caret-color: transparent; }
+.tiptap > *:first-child { margin-top: 0; }
+.tiptap p { @apply my-2; }
+.tiptap h1 { @apply font-bold mt-6 mb-3; font-size: calc(var(--editor-font-size, 16px) * 1.875); }
+.tiptap h2 { @apply font-bold mt-5 mb-2; font-size: calc(var(--editor-font-size, 16px) * 1.5); }
+.tiptap h3 { @apply font-semibold mt-4 mb-2; font-size: calc(var(--editor-font-size, 16px) * 1.25); }
+.tiptap ul { @apply list-disc pl-6 my-2; }
+.tiptap ol { @apply list-decimal pl-6 my-2; }
+.tiptap li { @apply my-1; }
+.tiptap blockquote {
+  @apply border-l-4 border-primary/40 pl-4 italic text-muted-foreground my-3;
+}
+.tiptap code {
+  @apply bg-muted px-1.5 py-0.5 rounded text-sm font-mono text-primary;
+}
+.tiptap pre {
+  @apply bg-muted rounded-lg p-4 my-3 overflow-x-auto;
+}
+.tiptap pre code {
+  @apply bg-transparent p-0 text-foreground text-sm;
+}
+.tiptap hr { @apply border-border my-6; }
+.tiptap a { @apply text-primary underline underline-offset-2; }
+.tiptap mark { @apply bg-yellow-500/30 px-0.5 rounded; }
+.tiptap ul[data-type="taskList"] { @apply list-none pl-0; }
+.tiptap ul[data-type="taskList"] li {
+  @apply flex items-start gap-2 my-1;
+}
+.tiptap ul[data-type="taskList"] li label {
+  @apply mt-1;
+}
+.tiptap p.is-editor-empty:first-child::before {
+  @apply text-muted-foreground pointer-events-none float-left h-0;
+  content: attr(data-placeholder);
+}
+
+/* Custom caret — scales with font size, smooth blink, replaces native caret */
+.custom-caret {
+  display: inline-block;
+  position: relative;
+  z-index: 1;
+  width: 2px;
+  height: 1.2em;
+  margin-left: -1px;
+  margin-right: -1px;
+  vertical-align: text-bottom;
+  background: hsl(var(--primary));
+  border-radius: 1px;
+  pointer-events: none;
+  animation: caret-blink 1s ease-in-out infinite;
+}
+.tiptap:not(.ProseMirror-focused) .custom-caret {
+  display: none;
+}
+@keyframes caret-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.tiptap img {
+  @apply rounded-lg max-w-full h-auto my-4 border border-border;
+}
+.tiptap img.ProseMirror-selectednode {
+  @apply ring-2 ring-primary;
+}
+
+/* ProseMirror search decorations (Editor.tsx) */
+.search-hl { @apply bg-yellow-400/30 rounded-sm; }
+.search-hl-active { @apply bg-yellow-400/80 text-black rounded-sm; }
+
+/* Virtualised paragraph rendering — browser skips layout/paint for off-screen */
+.virtual-para {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 1.5em;
+}
+
+/* Cursor resize prevention during drag */
+.resizing-col * { cursor: col-resize !important; }
+.resizing-row * { cursor: row-resize !important; }
+
+/* Image in viewer modal */
+.viewer-modal-image {
+  max-width: none;
+  max-height: none;
+}
+
+/* Topic highlight — applied when clicking a topic in the AI sidebar */
+.topic-highlight {
+  background: rgba(59, 130, 246, 0.25);
+  border-radius: 2px;
+  transition: background 0.3s ease;
+}
+
+/* Bounce animation for loading dots */
+@keyframes bounce {
+  0%, 80%, 100% { transform: translateY(0); }
+  40% { transform: translateY(-6px); }
+}

@@ -1,0 +1,31 @@
+[package]
+name = "epito"
+version = "1.0.0"
+description = "AI-powered note-taking with semantic search"
+authors = ["subratomandal"]
+license = "MIT"
+repository = ""
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.6", features = [] }
+
+[dependencies]
+serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+log = "0.4"
+tauri = { version = "2.10.3", features = [] }
+tauri-plugin-log = "2"
+tauri-plugin-shell = "2"
+portpicker = "0.1"
+reqwest = { version = "0.12", features = ["blocking", "stream", "rustls-tls"], default-features = false }
+dirs = "6"
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+ctrlc = "3.4"
+tauri-plugin-dialog = "2"

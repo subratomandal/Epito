@@ -1,0 +1,58 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "Epito",
+  "version": "1.0.0",
+  "identifier": "com.epito.app",
+  "build": {
+    "devUrl": "http://127.0.0.1:3000",
+    "beforeDevCommand": "node -e \"require('fs').mkdirSync('.next/standalone',{recursive:true})\" && npm run dev",
+    "beforeBuildCommand": "node scripts/downloadNode.mjs && npm run build:standalone"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "Epito",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "resizable": true,
+        "fullscreen": false,
+        "center": true,
+        "decorations": true,
+        "url": "about:blank"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; connect-src 'self' http://localhost:* http://127.0.0.1:*; img-src 'self' data: blob: http://localhost:* http://127.0.0.1:*; font-src 'self' data:;"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "resources": [
+      "../.next/standalone/**/*"
+    ],
+    "externalBin": [
+      "binaries/llama-server",
+      "binaries/node"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "10.15",
+      "frameworks": []
+    },
+    "windows": {
+      "webviewInstallMode": {
+        "type": "embedBootstrapper"
+      }
+    }
+  }
+}
