@@ -406,10 +406,20 @@ fn build_args(
         "--cache-reuse".into(), "256".into(),
         "--defrag-thold".into(), "0.1".into(),
         "--slot-prompt-similarity".into(), "0.5".into(),
-        "--mlock".into(),
         "--batch-size".into(), "512".into(),
         "--ubatch-size".into(), "256".into(),
     ];
+
+    // Memory strategy:
+    //   macOS (Metal): --mlock — lock model in unified memory (shared CPU/GPU RAM)
+    //   Windows/Linux: --mmap (default) — memory-mapped, OS loads pages on demand
+    //                  This reduces initial RAM usage; model pages load as needed.
+    if cfg!(target_os = "macos") {
+        args.push("--mlock".into());
+        log::info!("[llama-server] Memory: mlock (unified memory)");
+    } else {
+        log::info!("[llama-server] Memory: mmap (demand-paged, lower initial RAM)");
+    }
 
     match gpu {
         GpuBackend::Metal => {

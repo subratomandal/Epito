@@ -1,11 +1,43 @@
 const LLAMA_PORT = process.env.LLAMA_SERVER_PORT || '8080';
 const LLAMA_URL = `http://127.0.0.1:${LLAMA_PORT}`;
 const MODEL = 'mistral-7b-instruct';
+const IDLE_TIMEOUT_MS = 120_000; // 2 minutes — unload model after inactivity
 
-console.log(`[LLM] Configured: url=${LLAMA_URL}, model=${MODEL}`);
+console.log(`[LLM] Configured: url=${LLAMA_URL}, model=${MODEL}, idle_timeout=${IDLE_TIMEOUT_MS / 1000}s`);
 
 let inferenceActive = false;
 const inferenceQueue: Array<{ resolve: () => void }> = [];
+
+// ─── Idle Model Unloading ────────────────────────────────────────────────────
+// After 120s of no AI requests, tell llama-server to unload the model from
+// GPU/CPU memory via POST /slots/0?action=erase. The process stays alive;
+// the model reloads automatically on the next inference request.
+// This matches how Ollama manages model memory.
+
+let idleTimer: ReturnType<typeof setTimeout> | null = null;
+let modelLoadedInMemory = false;
+
+function resetIdleTimer(): void {
+  if (idleTimer) clearTimeout(idleTimer);
+  modelLoadedInMemory = true;
+  idleTimer = setTimeout(unloadIdleModel, IDLE_TIMEOUT_MS);
+}
+
+async function unloadIdleModel(): Promise<void> {
+  if (!modelLoadedInMemory) return;
+  try {
+    const res = await fetch(`${LLAMA_URL}/slots/0?action=erase`, {
+      method: 'POST',
+      signal: AbortSignal.timeout(5000),
+    });
+    if (res.ok) {
+      modelLoadedInMemory = false;
+      console.log('[LLM] Model unloaded from memory (idle timeout 120s). Will reload on next request.');
+    }
+  } catch {
+    // llama-server may not be running — that's fine
+  }
+}
 
 async function acquireInferenceLock(): Promise<void> {
   if (!inferenceActive) {
@@ -111,6 +143,7 @@ async function callLlama(prompt: string, systemPrompt: string, maxTokens?: numbe
   const effectiveMax = adaptiveMaxTokens(maxTokens);
 
   await acquireInferenceLock();
+  resetIdleTimer();
   const startTime = Date.now();
 
   try {
@@ -135,6 +168,8 @@ async function callLlama(prompt: string, systemPrompt: string, maxTokens?: numbe
     }
 
     const data = await res.json();
+    const duration = Date.now() - startTime;
+    console.log(`[LLM] Inference complete: ${duration}ms`);
     return data.choices[0].message.content;
   } finally {
     recordInferenceTime(Date.now() - startTime);
@@ -149,6 +184,7 @@ async function* callLlamaStream(prompt: string, systemPrompt: string, maxTokens?
   const effectiveMax = adaptiveMaxTokens(maxTokens);
 
   await acquireInferenceLock();
+  resetIdleTimer();
   const startTime = Date.now();
 
   try {
