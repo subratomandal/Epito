@@ -167,13 +167,21 @@ fn check_node_binary(path: &std::path::Path) -> Option<String> {
     }
 
     log::info!("[Node] Found valid binary at {:?} ({:.1} MB)", path, size as f64 / 1_048_576.0);
+    Some(normalize_windows_path(path).to_string_lossy().to_string())
+}
+
+/// Resolve a path and strip the Windows UNC `\\?\` prefix.
+/// UNC paths break DLL loading and some Node.js module resolution.
+pub(crate) fn normalize_windows_path(path: &std::path::Path) -> std::path::PathBuf {
     let resolved = path.canonicalize().unwrap_or(path.to_path_buf());
-    let mut result = resolved.to_string_lossy().to_string();
-    // Strip Windows UNC \\?\ prefix to avoid path issues
-    if result.starts_with(r"\\?\") {
-        result = result[4..].to_string();
+    #[cfg(windows)]
+    {
+        let s = resolved.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            return std::path::PathBuf::from(stripped);
+        }
     }
-    Some(result)
+    resolved
 }
 
 pub(crate) fn kill_process_tree(child: &mut Child) {
@@ -565,8 +573,10 @@ pub fn run() {
                 .resource_dir()
                 .map_err(|e| format!("Failed to get resource directory: {}", e))?;
 
-            let standalone_dir = resource_dir.join("_up_").join(".next").join("standalone");
-            let server_js = standalone_dir.join("server.js");
+            let standalone_dir = normalize_windows_path(&resource_dir.join("_up_").join(".next").join("standalone"));
+            let server_js = normalize_windows_path(&standalone_dir.join("server.js"));
+            log::info!("[Node] Standalone dir: {:?}", standalone_dir);
+            log::info!("[Node] Server entry: {:?}", server_js);
 
             if !server_js.exists() {
                 log::error!("Standalone server not found at {:?}", server_js);

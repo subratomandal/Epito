@@ -8,43 +8,94 @@ use tauri::Manager;
 use crate::model;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
 enum GpuBackend {
     Metal,
-    Cuda,
-    Rocm,
+    Vulkan,   // Works with NVIDIA, AMD, Intel GPUs — universal
+    Cuda,     // NVIDIA only — fastest but needs CUDA runtime
+    Rocm,     // AMD on Linux only
     CpuOnly,
 }
 
+/// Detect the best available GPU backend.
+/// On Windows, checks for GPU presence via nvidia-smi and WMIC.
+/// Prefers Vulkan as the universal GPU backend (works with all vendors).
 fn detect_gpu_backend() -> GpuBackend {
     if cfg!(target_os = "macos") {
-        log::info!("[GPU] Detected macOS — using Metal / MLX backend");
+        log::info!("[GPU] macOS — using Metal backend");
         return GpuBackend::Metal;
     }
 
-    if let Ok(output) = Command::new("nvidia-smi")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    // --- Check for NVIDIA GPU ---
+    // nvidia-smi is at C:\Windows\System32\nvidia-smi.exe on Windows
+    let has_nvidia = check_command_exists("nvidia-smi");
+
+    // --- Check for any GPU via WMIC (Windows) ---
+    #[cfg(target_os = "windows")]
     {
-        if output.success() {
-            log::info!("[GPU] Detected NVIDIA GPU — using CUDA acceleration");
-            return GpuBackend::Cuda;
+        if let Ok(output) = Command::new("wmic")
+            .args(["path", "win32_VideoController", "get", "name"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let line = line.trim();
+                if line.is_empty() || line == "Name" { continue; }
+                log::info!("[GPU] Found GPU: {}", line);
+            }
         }
     }
 
-    if let Ok(output) = Command::new("rocminfo")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+    if has_nvidia {
+        // Check if we have the ggml-vulkan.dll (Vulkan build) or ggml-cuda.dll
+        // Vulkan is preferred because it doesn't need the 574MB CUDA runtime
+        log::info!("[GPU] NVIDIA GPU detected — will use GPU acceleration");
+        return GpuBackend::Vulkan;
+    }
+
+    // --- Check for AMD GPU (Linux: ROCm, Windows: Vulkan) ---
+    #[cfg(target_os = "linux")]
     {
-        if output.success() {
-            log::info!("[GPU] Detected AMD GPU — using ROCm backend");
+        if check_command_exists("rocminfo") {
+            log::info!("[GPU] AMD GPU detected — using ROCm backend");
             return GpuBackend::Rocm;
         }
     }
 
-    log::info!("[GPU] No GPU detected — using optimized CPU inference (AVX)");
+    // --- Windows: any GPU that's not NVIDIA can use Vulkan ---
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(output) = Command::new("wmic")
+            .args(["path", "win32_VideoController", "get", "name"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let l = line.trim().to_lowercase();
+                if l.contains("radeon") || l.contains("amd") ||
+                   l.contains("arc") || l.contains("iris") {
+                    log::info!("[GPU] Discrete/integrated GPU detected — using Vulkan backend");
+                    return GpuBackend::Vulkan;
+                }
+            }
+        }
+    }
+
+    log::info!("[GPU] No GPU detected — using CPU inference");
     GpuBackend::CpuOnly
+}
+
+fn check_command_exists(cmd: &str) -> bool {
+    Command::new(cmd)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 pub struct LlamaProcess {
@@ -126,15 +177,7 @@ fn check_binary_valid(path: &std::path::Path) -> Option<String> {
         return None;
     }
     log::info!("[llama-server] Found valid binary at {:?} ({:.1} MB)", path, size as f64 / 1_048_576.0);
-    let resolved = path.canonicalize().unwrap_or(path.to_path_buf());
-    let mut result = resolved.to_string_lossy().to_string();
-    // Strip Windows UNC \\?\ prefix — it can break DLL loading when used
-    // with Command::new() because the DLL loader may not resolve the exe's
-    // directory correctly from a \\?\ path.
-    if result.starts_with(r"\\?\") {
-        result = result[4..].to_string();
-    }
-    Some(result)
+    Some(crate::normalize_windows_path(path).to_string_lossy().to_string())
 }
 
 pub fn start(
@@ -195,21 +238,26 @@ pub fn start(
 
     match gpu {
         GpuBackend::Metal => {
-            log::info!("[llama-server] Configuring for Metal: full GPU offload + flash attention");
+            log::info!("[llama-server] Metal: full GPU offload + flash attention");
             args.extend(["--n-gpu-layers".into(), "99".into()]);
             args.push("--flash-attn".into());
         }
+        GpuBackend::Vulkan => {
+            log::info!("[llama-server] Vulkan: full GPU offload");
+            args.extend(["--n-gpu-layers".into(), "99".into()]);
+            // Vulkan doesn't support flash attention in llama.cpp
+        }
         GpuBackend::Cuda => {
-            log::info!("[llama-server] Configuring for CUDA: full GPU offload + flash attention");
+            log::info!("[llama-server] CUDA: full GPU offload + flash attention");
             args.extend(["--n-gpu-layers".into(), "99".into()]);
             args.push("--flash-attn".into());
         }
         GpuBackend::Rocm => {
-            log::info!("[llama-server] Configuring for ROCm: full GPU offload");
+            log::info!("[llama-server] ROCm: full GPU offload");
             args.extend(["--n-gpu-layers".into(), "99".into()]);
         }
         GpuBackend::CpuOnly => {
-            log::info!("[llama-server] Configuring for CPU-only: no GPU offload");
+            log::info!("[llama-server] CPU-only: no GPU offload");
             args.extend(["--n-gpu-layers".into(), "0".into()]);
         }
     }
