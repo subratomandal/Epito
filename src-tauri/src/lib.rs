@@ -707,11 +707,24 @@ pub fn run() {
         .run(|app_handle, event| {
             match event {
                 tauri::RunEvent::WindowEvent {
-                    label, event: tauri::WindowEvent::CloseRequested { .. }, ..
+                    label, event: tauri::WindowEvent::CloseRequested { api, .. }, ..
                 } => {
                     if label == "main" {
-                        // Trigger full shutdown on window close, not just on Exit
-                        perform_shutdown(app_handle);
+                        // Play exit animation before closing
+                        api.prevent_close();
+                        if let Some(window) = app_handle.get_webview_window("main") {
+                            // Trigger CSS fade-out animation
+                            let _ = window.eval("document.documentElement.classList.add('app-closing')");
+                            let w = window.clone();
+                            let h = app_handle.clone();
+                            thread::spawn(move || {
+                                thread::sleep(Duration::from_millis(300));
+                                perform_shutdown(&h);
+                                let _ = w.destroy();
+                            });
+                        } else {
+                            perform_shutdown(app_handle);
+                        }
                     }
                 }
                 tauri::RunEvent::Exit => {

@@ -35,6 +35,18 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <script dangerouslySetInnerHTML={{
           __html: `if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js')})}`,
         }} />
+        <script dangerouslySetInnerHTML={{
+          __html: `
+            // Exit animation: intercept window close, play fade-out, then close
+            window.addEventListener('beforeunload', function() {
+              document.documentElement.classList.add('app-closing');
+            });
+            // Tauri: listen for close event to trigger animation
+            if(window.__TAURI_INTERNALS__){
+              window.__TAURI_INTERNALS__.invoke('plugin:event|listen',{event:'tauri://close-requested',handler:0}).catch(function(){});
+            }
+          `,
+        }} />
       </head>
       <body className={`${inter.className} bg-background text-foreground antialiased`}>
         {children}

@@ -159,3 +159,40 @@
   0%, 80%, 100% { transform: translateY(0); }
   40% { transform: translateY(-6px); }
 }
+
+/* ─── App launch / exit transitions ─────────────────────────────────── */
+
+/* Initial state: content hidden */
+body {
+  opacity: 0;
+  animation: epito-fade-in 0.6s ease-out 0.1s forwards;
+}
+
+@keyframes epito-fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.98) translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1) translateY(0);
+  }
+}
+
+/* Exit animation — triggered by adding .app-closing to <html> */
+html.app-closing body {
+  animation: epito-fade-out 0.3s ease-in forwards !important;
+}
+
+@keyframes epito-fade-out {
+  from {
+    opacity: 1;
+    transform: scale(1);
+    filter: blur(0);
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.97);
+    filter: blur(2px);
+  }
+}
