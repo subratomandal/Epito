@@ -84,8 +84,9 @@ for (const mod of NATIVE_MODULES) {
 
 const bsqlDest = join(STANDALONE_MODULES, 'better-sqlite3');
 if (existsSync(bsqlDest)) {
-  // Only prebuilds/<platform> and lib/ are needed at runtime
-  for (const dir of ['build', 'deps', 'src', 'benchmark', 'test']) {
+  // Keep build/Release/better_sqlite3.node (the actual native binary)
+  // Strip everything else: .o files, .a files, deps/, src/, test/
+  for (const dir of ['deps', 'src', 'benchmark', 'test']) {
     const target = join(bsqlDest, dir);
     if (existsSync(target)) {
       const size = dirSize(target);
@@ -94,7 +95,40 @@ if (existsSync(bsqlDest)) {
       console.log(`  STRIP: better-sqlite3/${dir}/ (${mb(size)})`);
     }
   }
-  // Ensure prebuilds are present
+
+  // Strip build artifacts (.o, .a, .mk) but keep .node binaries
+  const buildRelease = join(bsqlDest, 'build', 'Release');
+  if (existsSync(buildRelease)) {
+    for (const f of readdirSync(buildRelease, { recursive: true, withFileTypes: false })) {
+      // Keep only .node files, remove .o, .a, .target dirs
+    }
+    const objDir = join(buildRelease, 'obj.target');
+    if (existsSync(objDir)) {
+      const size = dirSize(objDir);
+      rmSync(objDir, { recursive: true, force: true });
+      totalSaved += size;
+      console.log(`  STRIP: better-sqlite3/build/Release/obj.target/ (${mb(size)})`);
+    }
+    // Remove .a static libraries
+    for (const f of readdirSync(buildRelease)) {
+      if (f.endsWith('.a')) {
+        const target = join(buildRelease, f);
+        const size = statSync(target).size;
+        rmSync(target);
+        totalSaved += size;
+        console.log(`  STRIP: better-sqlite3/build/Release/${f} (${mb(size)})`);
+      }
+    }
+    // Remove test_extension.node (not needed at runtime)
+    const testExt = join(buildRelease, 'test_extension.node');
+    if (existsSync(testExt)) {
+      const size = statSync(testExt).size;
+      rmSync(testExt);
+      totalSaved += size;
+    }
+  }
+
+  // Ensure prebuilds are present (fallback for bindings module)
   const prebuildsSrc = join(ROOT, 'node_modules', 'better-sqlite3', 'prebuilds');
   if (existsSync(prebuildsSrc)) {
     const prebuildsDest = join(bsqlDest, 'prebuilds');
