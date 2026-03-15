@@ -11,7 +11,7 @@ import {
 } from 'lucide-react';
 import type { Note, Document, UploadedImage } from '@/lib/types';
 
-const ORDER_KEY = 'epito-note-order';
+const ORDER_SETTING_KEY = 'note-order';
 
 interface SidebarProps {
   notes: Note[];
@@ -59,15 +59,30 @@ export default function Sidebar({
   const noteListRef = useRef<HTMLDivElement>(null);
   const [dragState, setDragState] = useState<{ srcIdx: number; overIdx: number } | null>(null);
 
-  const [noteOrder, setNoteOrder] = useState<string[]>(() => {
-    if (typeof window === 'undefined') return [];
-    try { return JSON.parse(localStorage.getItem(ORDER_KEY) || '[]'); } catch { return []; }
-  });
+  const [noteOrder, setNoteOrder] = useState<string[]>([]);
+  const orderLoadedRef = useRef(false);
 
+  // Load persisted order from server database (survives port changes, app restarts)
   useEffect(() => {
-    if (noteOrder.length > 0) {
-      localStorage.setItem(ORDER_KEY, JSON.stringify(noteOrder));
-    }
+    fetch('/api/settings?key=note-order')
+      .then(r => r.ok ? r.json() : { value: null })
+      .then(data => {
+        if (Array.isArray(data.value) && data.value.length > 0) {
+          setNoteOrder(data.value);
+        }
+        orderLoadedRef.current = true;
+      })
+      .catch(() => { orderLoadedRef.current = true; });
+  }, []);
+
+  // Save order to server when it changes (skip the initial load)
+  useEffect(() => {
+    if (!orderLoadedRef.current || noteOrder.length === 0) return;
+    fetch('/api/settings', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ key: 'note-order', value: noteOrder }),
+    }).catch(() => {});
   }, [noteOrder]);
 
   const orderedNotes = useMemo(() => {

@@ -4,7 +4,16 @@ import { checkLlamaConnection } from '@/lib/ai/llm';
 
 export const dynamic = 'force-dynamic';
 
-export async function GET() {
+export async function GET(request: NextRequest) {
+  const { searchParams } = new URL(request.url);
+  const key = searchParams.get('key');
+
+  // GET /api/settings?key=note-order → return specific setting
+  if (key) {
+    const value = db.getSetting(key);
+    return NextResponse.json({ key, value: value ? JSON.parse(value) : null });
+  }
+
   const llama = await checkLlamaConnection();
   return NextResponse.json({
     theme: db.getSetting('theme') || 'dark',
@@ -26,6 +35,12 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid theme value' }, { status: 400 });
     }
     db.setSetting('theme', body.theme);
+  }
+
+  // PUT /api/settings with { key: "note-order", value: [...] }
+  if (body.key !== undefined && body.value !== undefined) {
+    db.setSetting(body.key, JSON.stringify(body.value));
+    return NextResponse.json({ key: body.key, value: body.value });
   }
 
   const llama = await checkLlamaConnection();

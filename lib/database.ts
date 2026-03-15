@@ -648,7 +648,7 @@ export function setSetting(key: string, value: string, isEncrypted = false) {
   const db = getDb();
   const storedValue = isEncrypted ? encrypt(value) : value;
   db.prepare(
-    'INSERT OR REPLACE INTO settings (key, value, encrypted, updated_at) VALUES (?, ?, ?, datetime("now"))'
+    "INSERT OR REPLACE INTO settings (key, value, encrypted, updated_at) VALUES (?, ?, ?, datetime('now'))"
   ).run(key, storedValue, isEncrypted ? 1 : 0);
 }
 
