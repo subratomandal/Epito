@@ -21,7 +21,8 @@
         "fullscreen": false,
         "center": true,
         "decorations": true,
-        "url": "about:blank"
+        "url": "about:blank",
+        "backgroundColor": "#0a0a0f"
       }
     ],
     "security": {
