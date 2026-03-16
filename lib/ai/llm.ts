@@ -585,94 +585,303 @@ export function getGreetingResponse(): string {
   return GREETING_RESPONSES[Math.floor(Math.random() * GREETING_RESPONSES.length)];
 }
 
-const CHAT_SYSTEM_PROMPT = `You are a knowledgeable assistant helping the user understand and discuss a document. The document content is provided as context. Answer questions thoroughly and accurately based on the document. If the answer is not in the document, say so clearly. Be conversational but substantive.`;
+// ─── Production Chat System ──────────────────────────────────────────────────
+// Architecture:
+//   1. Proper multi-turn message format (not flat string concatenation)
+//   2. History windowed to last 6 messages (3 turns)
+//   3. Older messages auto-summarized to preserve context
+//   4. Repetition/presence penalties prevent loops
+//   5. Output validation detects and retries bad responses
+//   6. Retrieved context injected as system context, not in user message
 
-function buildChatPrompt(
-  documentText: string,
-  userMessage: string,
-  history: { role: string; content: string }[],
-): string {
-  let prompt = `Document context:\n"""\n${documentText}\n"""\n\n`;
+const MAX_RECENT_MESSAGES = 6; // 3 user + 3 assistant turns
+const CHAT_MAX_TOKENS = 250;
+const CHAT_TEMPERATURE = 0.6;
+const REPEAT_PENALTY = 1.15;
+const PRESENCE_PENALTY = 0.15;
 
-  if (history.length > 0) {
-    prompt += 'Conversation so far:\n';
-    for (const msg of history) {
-      prompt += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}\n`;
+const CHAT_SYSTEM_PROMPT = `You are a knowledgeable assistant helping the user understand and discuss a document. Answer accurately based on the provided context. If the answer is not in the context, say so clearly. Be concise and conversational. Never repeat your previous answers.`;
+
+const RAG_SYSTEM_PROMPT = `You are a document analysis assistant.
+
+STRICT RULES:
+- Use ONLY the provided context passages to answer.
+- If the answer is not in the context, say: "The answer is not available in the provided document."
+- Never use outside knowledge.
+- Keep responses under 150 words.
+- Reference which passage your answer draws from.
+- Never repeat a previous answer. Each response must be unique.`;
+
+type ChatMessage = { role: string; content: string };
+
+/** Compress older conversation turns into a brief summary. */
+function summarizeOlderMessages(older: ChatMessage[]): string {
+  if (older.length === 0) return '';
+  const parts: string[] = [];
+  for (let i = 0; i < older.length; i += 2) {
+    const userMsg = older[i];
+    const assistantMsg = older[i + 1];
+    if (userMsg) {
+      const topic = userMsg.content.slice(0, 100).replace(/\n/g, ' ');
+      const answer = assistantMsg
+        ? assistantMsg.content.slice(0, 80).replace(/\n/g, ' ')
+        : '';
+      parts.push(`User asked: "${topic}${userMsg.content.length > 100 ? '...' : ''}"${answer ? ` → Assistant: "${answer}..."` : ''}`);
     }
-    prompt += '\n';
+  }
+  return parts.join('\n');
+}
+
+/** Window history: keep recent turns, summarize older ones. */
+function windowHistory(history: ChatMessage[]): { summary: string; recent: ChatMessage[] } {
+  if (history.length <= MAX_RECENT_MESSAGES) {
+    return { summary: '', recent: history };
+  }
+  const older = history.slice(0, -MAX_RECENT_MESSAGES);
+  const recent = history.slice(-MAX_RECENT_MESSAGES);
+  return { summary: summarizeOlderMessages(older), recent };
+}
+
+/** Build proper multi-turn message array for llama-server /v1/chat/completions */
+function buildChatMessages(
+  systemPrompt: string,
+  context: string,
+  summary: string,
+  recentHistory: ChatMessage[],
+  userMessage: string,
+): Array<{ role: string; content: string }> {
+  // System prompt with context embedded
+  let system = systemPrompt;
+  if (context) {
+    system += `\n\nDocument context:\n"""\n${context}\n"""`;
+  }
+  if (summary) {
+    system += `\n\nConversation summary (earlier messages):\n${summary}`;
   }
 
-  prompt += `User: ${userMessage}\n\nProvide a thorough, helpful response:`;
-  return prompt;
+  const messages: Array<{ role: string; content: string }> = [
+    { role: 'system', content: system },
+  ];
+
+  // Add recent history as proper alternating role messages
+  for (const msg of recentHistory) {
+    messages.push({
+      role: msg.role === 'user' ? 'user' : 'assistant',
+      content: msg.content,
+    });
+  }
+
+  // Current user message
+  messages.push({ role: 'user', content: userMessage });
+
+  return messages;
 }
+
+/** Detect bad output: repetition, empty, or loops */
+function validateOutput(text: string): boolean {
+  if (!text || text.trim().length < 2) return false;
+
+  // Detect sentence-level repetition (same sentence 3+ times)
+  const sentences = text.split(/[.!?]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 10);
+  const seen = new Map<string, number>();
+  for (const s of sentences) {
+    seen.set(s, (seen.get(s) || 0) + 1);
+    if ((seen.get(s) || 0) >= 3) return false;
+  }
+
+  // Detect phrase-level loops (20+ char substring repeated 3+ times)
+  const lower = text.toLowerCase();
+  for (let len = 20; len <= 60; len += 10) {
+    for (let i = 0; i <= lower.length - len; i += 10) {
+      const phrase = lower.slice(i, i + len);
+      let count = 0;
+      let pos = 0;
+      while ((pos = lower.indexOf(phrase, pos)) !== -1) { count++; pos += 1; }
+      if (count >= 3) return false;
+    }
+  }
+
+  return true;
+}
+
+/** Core chat call with proper format, penalties, and validation */
+async function callChat(
+  systemPrompt: string,
+  context: string,
+  userMessage: string,
+  history: ChatMessage[],
+  maxTokens: number = CHAT_MAX_TOKENS,
+): Promise<string> {
+  await ensureLlamaRunning();
+  await acquireInferenceLock();
+  resetIdleTimer();
+  const startTime = Date.now();
+
+  try {
+    const { summary, recent } = windowHistory(history);
+    const messages = buildChatMessages(systemPrompt, context, summary, recent, userMessage);
+
+    const body = {
+      messages,
+      temperature: CHAT_TEMPERATURE,
+      repeat_penalty: REPEAT_PENALTY,
+      presence_penalty: PRESENCE_PENALTY,
+      top_p: 0.9,
+      max_tokens: maxTokens,
+      stream: false,
+    };
+
+    const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`LLM error: ${res.status}`);
+
+    const data = await res.json();
+    let response = data.choices?.[0]?.message?.content || '';
+
+    // Validate output — retry once if bad
+    if (!validateOutput(response)) {
+      console.warn('[Chat] Bad output detected (repetition/empty), retrying...');
+      const retryBody = { ...body, temperature: 0.8, repeat_penalty: 1.3 };
+      const retryRes = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(retryBody),
+      });
+      if (retryRes.ok) {
+        const retryData = await retryRes.json();
+        response = retryData.choices?.[0]?.message?.content || response;
+      }
+    }
+
+    console.log(`[Chat] ${Date.now() - startTime}ms | turns=${history.length / 2} | summary=${summary ? 'yes' : 'no'}`);
+    return response;
+  } finally {
+    recordInferenceTime(Date.now() - startTime);
+    releaseInferenceLock();
+  }
+}
+
+/** Core streaming chat with anti-loop protection */
+async function* streamChat(
+  systemPrompt: string,
+  context: string,
+  userMessage: string,
+  history: ChatMessage[],
+  maxTokens: number = CHAT_MAX_TOKENS,
+): AsyncGenerator<string> {
+  await ensureLlamaRunning();
+  await acquireInferenceLock();
+  resetIdleTimer();
+  const startTime = Date.now();
+
+  try {
+    const { summary, recent } = windowHistory(history);
+    const messages = buildChatMessages(systemPrompt, context, summary, recent, userMessage);
+
+    const body = {
+      messages,
+      temperature: CHAT_TEMPERATURE,
+      repeat_penalty: REPEAT_PENALTY,
+      presence_penalty: PRESENCE_PENALTY,
+      top_p: 0.9,
+      max_tokens: maxTokens,
+      stream: true,
+    };
+
+    const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`LLM error: ${res.status}`);
+
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error('No response body');
+
+    const decoder = new TextDecoder();
+    let accumulated = '';
+    let buffer = '';
+    let lastYielded = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith('data: ')) continue;
+        const payload = trimmed.slice(6);
+        if (payload === '[DONE]') continue;
+        try {
+          const data = JSON.parse(payload);
+          const content = data.choices?.[0]?.delta?.content;
+          if (content) {
+            accumulated += content;
+
+            // Anti-loop: detect if last 60 chars are repeating
+            if (accumulated.length > 120) {
+              const tail = accumulated.slice(-60);
+              const before = accumulated.slice(-120, -60);
+              if (tail === before) {
+                console.warn('[Chat] Loop detected in stream, stopping');
+                return;
+              }
+            }
+
+            yield accumulated;
+          }
+        } catch {}
+      }
+    }
+  } finally {
+    recordInferenceTime(Date.now() - startTime);
+    releaseInferenceLock();
+  }
+}
+
+// ─── Public Chat API (drop-in replacements) ──────────────────────────────────
 
 export async function chatWithContext(
   documentText: string,
   userMessage: string,
-  history: { role: string; content: string }[],
+  history: ChatMessage[],
 ): Promise<string> {
-  const cleaned = cleanInputText(documentText);
-  const prompt = buildChatPrompt(cleaned, userMessage, history);
-  return callLLM(prompt, CHAT_SYSTEM_PROMPT, MAX_OUTPUT_TOKENS);
+  const context = cleanInputText(documentText);
+  return callChat(CHAT_SYSTEM_PROMPT, context, userMessage, history);
 }
 
 export async function* chatWithContextStream(
   documentText: string,
   userMessage: string,
-  history: { role: string; content: string }[],
+  history: ChatMessage[],
 ): AsyncGenerator<string> {
-  const cleaned = cleanInputText(documentText);
-  const prompt = buildChatPrompt(cleaned, userMessage, history);
-  yield* streamLLM(prompt, CHAT_SYSTEM_PROMPT, MAX_OUTPUT_TOKENS);
-}
-
-const RAG_SYSTEM_PROMPT = `You are a document analysis assistant.
-
-STRICT RULES:
-- Use ONLY the provided context passages to answer the question.
-- If the answer is not contained in the context, respond with: "The answer is not available in the provided document."
-- Never use outside knowledge or make assumptions beyond what the context states.
-- Keep your response under 150 words. Be concise and precise.
-- Reference which passage(s) your answer draws from (e.g., "According to Passage 1...").
-- Be conversational but factual.`;
-
-function buildRAGPrompt(
-  chunks: string[],
-  userMessage: string,
-  history: { role: string; content: string }[],
-): string {
-  const context = chunks.map((c, i) => `[Passage ${i + 1}]\n${c}`).join('\n\n');
-
-  let prompt = `Context:\n"""\n${context}\n"""\n\n`;
-
-  if (history.length > 0) {
-    prompt += 'Conversation so far:\n';
-    for (const msg of history) {
-      prompt += `${msg.role === 'user' ? 'User' : 'Assistant'}: ${msg.content}\n`;
-    }
-    prompt += '\n';
-  }
-
-  prompt += `User Question:\n${userMessage}\n\nInstruction:\nAnswer the question strictly using the context above. Do not add external information. If the context does not contain the answer, say that the answer is not available in the document.`;
-  return prompt;
+  const context = cleanInputText(documentText);
+  yield* streamChat(CHAT_SYSTEM_PROMPT, context, userMessage, history);
 }
 
 export async function chatWithRAG(
   chunks: string[],
   userMessage: string,
-  history: { role: string; content: string }[],
+  history: ChatMessage[],
 ): Promise<string> {
-  const prompt = buildRAGPrompt(chunks, userMessage, history);
-  return callLLM(prompt, RAG_SYSTEM_PROMPT, MAX_OUTPUT_TOKENS);
+  const context = chunks.map((c, i) => `[Passage ${i + 1}]\n${c}`).join('\n\n');
+  return callChat(RAG_SYSTEM_PROMPT, context, userMessage, history);
 }
 
 export async function* chatWithRAGStream(
   chunks: string[],
   userMessage: string,
-  history: { role: string; content: string }[],
+  history: ChatMessage[],
 ): AsyncGenerator<string> {
-  const prompt = buildRAGPrompt(chunks, userMessage, history);
-  yield* streamLLM(prompt, RAG_SYSTEM_PROMPT, MAX_OUTPUT_TOKENS);
+  const context = chunks.map((c, i) => `[Passage ${i + 1}]\n${c}`).join('\n\n');
+  yield* streamChat(RAG_SYSTEM_PROMPT, context, userMessage, history);
 }
 
 function estimateTokens(text: string): number {
