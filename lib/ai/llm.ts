@@ -611,6 +611,10 @@ let chatTurns = 0;
 const excludedEntities: Set<string> = new Set();
 const recentResponses: string[] = [];
 
+// Two-tier summary: Tier 1 = rolling context (compressed aggressively).
+// Tier 2 = pinned facts (persist until explicitly changed by user).
+const pinnedFacts: string[] = [];
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
 function countTk(text: string): number { return Math.ceil(text.split(/\s+/).length * 1.3); }
@@ -733,37 +737,62 @@ function compressChunks(chunks: string[], maxTokens: number, excludeEntities: Se
 // ─── Step 6: Summary Management ──────────────────────────────────────────────
 
 async function manageSummary(history: ChatMessage[], intent: ChatIntent, frustrated: boolean): Promise<{ summary: string; recent: ChatMessage[] }> {
-  // Wipe summary on topic change, frustration, or correction
+  // Wipe rolling summary on topic change or frustration (pinned facts survive)
   if (intent === 'TOPIC_CHANGE' || frustrated) {
     cachedSummary = '';
     cachedSummaryLen = 0;
   }
 
+  // Extract pinned facts from corrections
+  if (intent === 'CORRECTION' && history.length > 0) {
+    const lastUser = history.filter(m => m.role === 'user').pop();
+    if (lastUser) {
+      const fact = lastUser.content.replace(/\b(no|wrong|incorrect|actually|the correct|it's)\b/gi, '').trim();
+      if (fact.length > 10 && fact.length < 200) {
+        // Avoid duplicate pins
+        if (!pinnedFacts.some(p => p.toLowerCase() === fact.toLowerCase())) {
+          pinnedFacts.push(fact);
+          if (pinnedFacts.length > 5) pinnedFacts.shift(); // max 5 pinned facts
+          console.log(`[Chat] Pinned fact: "${fact}"`);
+        }
+      }
+    }
+  }
+
   if (history.length <= MAX_RECENT) {
-    return { summary: frustrated ? '' : cachedSummary, recent: history };
+    const s = buildTwoTierSummary(frustrated ? '' : cachedSummary);
+    return { summary: s, recent: history };
   }
 
   const older = history.slice(0, -MAX_RECENT);
   const recent = history.slice(-MAX_RECENT);
 
-  // Re-summarize if needed
   if (older.length > cachedSummaryLen || intent === 'CORRECTION' || intent === 'TOPIC_CHANGE') {
     const convText = older.map(m => `${m.role === 'user' ? 'User' : 'Asst'}: ${m.content.slice(0, 100)}`).join('\n');
     const raw = await quickCall(
       `Summarize this conversation in 2-3 sentences. Include: what the user wanted, answers given, any corrections. Do not include entity names unless confirmed correct.\n\n${convText}\n\nSummary:`,
       80
     );
-    cachedSummary = truncTk(raw || '', TOKEN_BUDGET.summary);
+    cachedSummary = truncTk(raw || '', TOKEN_BUDGET.summary - (pinnedFacts.length * 15));
     cachedSummaryLen = older.length;
 
-    // Remove excluded entities from summary
     for (const entity of excludedEntities) {
       cachedSummary = cachedSummary.replace(new RegExp(entity, 'gi'), '[removed]');
     }
   }
 
   const truncated = recent.map(m => ({ ...m, content: truncTk(m.content, TOKEN_BUDGET.recentChat / MAX_RECENT) }));
-  return { summary: frustrated ? '' : cachedSummary, recent: truncated };
+  const s = buildTwoTierSummary(frustrated ? '' : cachedSummary);
+  return { summary: s, recent: truncated };
+}
+
+function buildTwoTierSummary(rollingSummary: string): string {
+  const parts: string[] = [];
+  if (rollingSummary) parts.push(rollingSummary);
+  if (pinnedFacts.length > 0) {
+    parts.push('Key facts: ' + pinnedFacts.join('. '));
+  }
+  return truncTk(parts.join('\n'), TOKEN_BUDGET.summary);
 }
 
 // ─── Step 7: Prompt Assembly ─────────────────────────────────────────────────
