@@ -758,7 +758,7 @@ const TOKEN_BUDGET = { system: 250, summary: 100, context: 800, recentChat: 500,
 const CHAT_MAX_TOKENS = 250;
 const MAX_RECENT = 6; // 3 turns
 const KV_RESET_INTERVAL = 6;
-const FALLBACK = "I couldn't find a clear answer in your notes. Could you rephrase your question?";
+const FALLBACK = "I couldn't find an answer in your notes for this.";
 
 // Session state
 let cachedSummary = '';
