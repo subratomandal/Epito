@@ -439,7 +439,7 @@ export default function HomePage() {
 
   return (
     <ErrorBoundary>
-    {showSplash && <BrandedSplash direction="in" onComplete={() => setShowSplash(false)} />}
+    {showSplash && <BrandedSplash onComplete={() => setShowSplash(false)} />}
     {showStartup && <StartupScreen onReady={() => setShowStartup(false)} />}
     <div className="flex h-screen overflow-hidden relative view-enter">
       {isMobile && (
