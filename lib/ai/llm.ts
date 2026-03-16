@@ -585,85 +585,247 @@ export function getGreetingResponse(): string {
   return GREETING_RESPONSES[Math.floor(Math.random() * GREETING_RESPONSES.length)];
 }
 
-// ─── Production Chat System ──────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Mistral 7B Chat System — Tuned for 4096-token sliding window attention
+//
 // Architecture:
-//   1. Proper multi-turn message format (not flat string concatenation)
-//   2. History windowed to last 6 messages (3 turns)
-//   3. Older messages auto-summarized to preserve context
-//   4. Repetition/presence penalties prevent loops
-//   5. Output validation detects and retries bad responses
-//   6. Retrieved context injected as system context, not in user message
-
-const MAX_RECENT_MESSAGES = 6; // 3 user + 3 assistant turns
-const CHAT_MAX_TOKENS = 250;
-const CHAT_TEMPERATURE = 0.6;
-const REPEAT_PENALTY = 1.15;
-const PRESENCE_PENALTY = 0.15;
-
-const CHAT_SYSTEM_PROMPT = `You are a knowledgeable assistant helping the user understand and discuss a document. Answer accurately based on the provided context. If the answer is not in the context, say so clearly. Be concise and conversational. Never repeat your previous answers.`;
-
-const RAG_SYSTEM_PROMPT = `You are a document analysis assistant.
-
-STRICT RULES:
-- Use ONLY the provided context passages to answer.
-- If the answer is not in the context, say: "The answer is not available in the provided document."
-- Never use outside knowledge.
-- Keep responses under 150 words.
-- Reference which passage your answer draws from.
-- Never repeat a previous answer. Each response must be unique.`;
+//   - Strict token budget enforcement (4096 total, 250 response cap)
+//   - History capped at 4 messages (2 turns) — Mistral can't leverage more
+//   - Older turns summarized via one-shot Mistral call
+//   - Query rewriting resolves coreferences ("what about that?" → standalone)
+//   - Dual-anchor grounding: instructions at TOP + reminder at BOTTOM
+//   - Aggressive anti-loop: 8-token ngram detection in streaming
+//   - Output validation with single retry on failure
+//   - KV cache rebuild every 6 turns
+// ═══════════════════════════════════════════════════════════════════════════════
 
 type ChatMessage = { role: string; content: string };
 
-/** Compress older conversation turns into a brief summary. */
-function summarizeOlderMessages(older: ChatMessage[]): string {
-  if (older.length === 0) return '';
-  const parts: string[] = [];
-  for (let i = 0; i < older.length; i += 2) {
-    const userMsg = older[i];
-    const assistantMsg = older[i + 1];
-    if (userMsg) {
-      const topic = userMsg.content.slice(0, 100).replace(/\n/g, ' ');
-      const answer = assistantMsg
-        ? assistantMsg.content.slice(0, 80).replace(/\n/g, ' ')
-        : '';
-      parts.push(`User asked: "${topic}${userMsg.content.length > 100 ? '...' : ''}"${answer ? ` → Assistant: "${answer}..."` : ''}`);
-    }
-  }
-  return parts.join('\n');
+// ─── Token Budget (4096 total) ───────────────────────────────────────────────
+const TOKEN_BUDGET = {
+  system: 200,
+  summary: 150,
+  context: 800,
+  recentChat: 600,
+  query: 150,
+  // response headroom: ~2196, capped at 250
+};
+const CHAT_MAX_TOKENS = 250;
+const MAX_RECENT_MESSAGES = 4; // 2 user + 2 assistant (Mistral can't use more)
+const KV_CACHE_RESET_INTERVAL = 6; // Reset every 6 turns
+
+// ─── Decoding Parameters (Mistral 7B specific) ──────────────────────────────
+const CHAT_PARAMS = {
+  temperature: 0.25,       // Low for factual grounding
+  repeat_penalty: 1.2,     // Critical — Mistral loops without this
+  presence_penalty: 0.15,
+  top_p: 0.9,
+  top_k: 40,
+  max_tokens: CHAT_MAX_TOKENS,
+};
+
+// ─── System Prompt (<200 tokens, short imperative sentences) ─────────────────
+const CHAT_SYSTEM = `You are Epito, a note assistant. Answer questions using only the provided Notes section. Be concise and factual. If the Notes do not contain the answer, say "I don't have that information in your notes." Do not invent facts. Do not repeat yourself.`;
+
+const RAG_SYSTEM = `You are Epito, a document assistant. Answer using ONLY the provided passages. Reference which passage you use. If no passage answers the question, say "I don't have that information in your notes." Be concise. Do not invent facts. Do not repeat yourself.`;
+
+// ─── Grounding Anchor (placed at END of prompt, re-anchors instructions) ─────
+const GROUNDING_ANCHOR = `Respond using only the information in Notes and Recent Chat. If the answer is not there, say you don't have that information.`;
+
+// ─── Token Estimation ────────────────────────────────────────────────────────
+
+function countTokens(text: string): number {
+  // Mistral tokenizer averages ~1.3 tokens per word
+  return Math.ceil(text.split(/\s+/).length * 1.3);
 }
 
-/** Window history: keep recent turns, summarize older ones. */
-function windowHistory(history: ChatMessage[]): { summary: string; recent: ChatMessage[] } {
-  if (history.length <= MAX_RECENT_MESSAGES) {
-    return { summary: '', recent: history };
+function truncateToTokens(text: string, maxTokens: number): string {
+  const words = text.split(/\s+/);
+  const maxWords = Math.floor(maxTokens / 1.3);
+  if (words.length <= maxWords) return text;
+  return words.slice(0, maxWords).join(' ') + '...';
+}
+
+// ─── Conversation Summary (Mistral one-shot call) ────────────────────────────
+
+let cachedSummary = '';
+let cachedSummaryTurnCount = 0;
+
+async function summarizeHistory(older: ChatMessage[]): Promise<string> {
+  if (older.length === 0) return '';
+
+  // Build conversation text for summarization
+  const convText = older.map(m =>
+    `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 150)}`
+  ).join('\n');
+
+  try {
+    const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          { role: 'user', content: `Summarize this conversation in 2-3 sentences. Keep: user goals, key facts, topics discussed.\n\n${convText}` },
+        ],
+        temperature: 0.1,
+        max_tokens: 100,
+        repeat_penalty: 1.1,
+        stream: false,
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const summary = data.choices?.[0]?.message?.content || '';
+      return truncateToTokens(summary, TOKEN_BUDGET.summary);
+    }
+  } catch (e) {
+    console.warn('[Chat] Summary call failed, using local compression:', e);
   }
+
+  // Fallback: local compression (no model call)
+  return older
+    .filter(m => m.role === 'user')
+    .map(m => m.content.slice(0, 60).replace(/\n/g, ' '))
+    .join('. ')
+    .slice(0, 200);
+}
+
+// ─── Query Rewriting (resolve coreferences for Mistral) ──────────────────────
+
+async function rewriteQuery(rawQuery: string, recentMessages: ChatMessage[]): Promise<string> {
+  // Skip rewriting for simple/short queries
+  if (rawQuery.split(/\s+/).length > 15 || recentMessages.length === 0) {
+    return rawQuery;
+  }
+
+  const recent = recentMessages.slice(-4).map(m =>
+    `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 100)}`
+  ).join('\n');
+
+  try {
+    const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        messages: [
+          { role: 'user', content: `Rewrite this question as a clear standalone question using the conversation context.\n\nContext:\n${recent}\n\nQuestion: ${rawQuery}\n\nOutput only the rewritten question, nothing else.` },
+        ],
+        temperature: 0.1,
+        max_tokens: 60,
+        repeat_penalty: 1.1,
+        stream: false,
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const rewritten = (data.choices?.[0]?.message?.content || '').trim();
+      if (rewritten && rewritten.length > 5 && rewritten.length < 300) {
+        console.log(`[Chat] Query rewrite: "${rawQuery}" → "${rewritten}"`);
+        return rewritten;
+      }
+    }
+  } catch {}
+
+  return rawQuery;
+}
+
+// ─── Context Compression ─────────────────────────────────────────────────────
+
+function compressContext(chunks: string[], maxTokens: number): string {
+  if (chunks.length === 0) return '';
+
+  const compressed: string[] = [];
+  let totalTokens = 0;
+
+  for (let i = 0; i < chunks.length && i < 5; i++) {
+    let chunk = chunks[i];
+
+    // Strip filler/hedging
+    chunk = chunk
+      .replace(/\b(however|moreover|furthermore|additionally|in addition|it is worth noting that|it should be noted that)\b/gi, '')
+      .replace(/\s{2,}/g, ' ')
+      .trim();
+
+    // Truncate individual chunks to ~3 sentences
+    const sentences = chunk.split(/(?<=[.!?])\s+/);
+    if (sentences.length > 3) {
+      chunk = sentences.slice(0, 3).join(' ');
+    }
+
+    const tokens = countTokens(chunk);
+    if (totalTokens + tokens > maxTokens) {
+      // Try to fit partial
+      const remaining = maxTokens - totalTokens;
+      if (remaining > 30) {
+        compressed.push(`[${i + 1}] ${truncateToTokens(chunk, remaining)}`);
+      }
+      break;
+    }
+
+    compressed.push(`[${i + 1}] ${chunk}`);
+    totalTokens += tokens;
+  }
+
+  return compressed.join('\n\n');
+}
+
+// ─── Window History + Summary ────────────────────────────────────────────────
+
+async function prepareHistory(history: ChatMessage[], turnCount: number): Promise<{
+  summary: string;
+  recent: ChatMessage[];
+  needsCacheReset: boolean;
+}> {
+  const needsCacheReset = turnCount > 0 && turnCount % KV_CACHE_RESET_INTERVAL === 0;
+
+  if (history.length <= MAX_RECENT_MESSAGES) {
+    return { summary: cachedSummary, recent: history, needsCacheReset };
+  }
+
   const older = history.slice(0, -MAX_RECENT_MESSAGES);
   const recent = history.slice(-MAX_RECENT_MESSAGES);
-  return { summary: summarizeOlderMessages(older), recent };
+
+  // Only re-summarize if history grew since last summary
+  if (older.length > cachedSummaryTurnCount) {
+    cachedSummary = await summarizeHistory(older);
+    cachedSummaryTurnCount = older.length;
+    console.log(`[Chat] Summarized ${older.length} older messages`);
+  }
+
+  // Truncate recent messages to fit token budget
+  const truncatedRecent = recent.map(m => ({
+    ...m,
+    content: truncateToTokens(m.content, TOKEN_BUDGET.recentChat / MAX_RECENT_MESSAGES),
+  }));
+
+  return { summary: cachedSummary, recent: truncatedRecent, needsCacheReset };
 }
 
-/** Build proper multi-turn message array for llama-server /v1/chat/completions */
-function buildChatMessages(
+// ─── Prompt Assembly (Mistral [INST] format via messages API) ────────────────
+// llama-server auto-applies Mistral's chat template when using /v1/chat/completions
+
+function buildPromptMessages(
   systemPrompt: string,
-  context: string,
   summary: string,
+  context: string,
   recentHistory: ChatMessage[],
-  userMessage: string,
+  rewrittenQuery: string,
 ): Array<{ role: string; content: string }> {
-  // System prompt with context embedded
-  let system = systemPrompt;
-  if (context) {
-    system += `\n\nDocument context:\n"""\n${context}\n"""`;
-  }
+  // Build system content with dual-anchor grounding
+  let system = truncateToTokens(systemPrompt, TOKEN_BUDGET.system);
+
   if (summary) {
-    system += `\n\nConversation summary (earlier messages):\n${summary}`;
+    system += `\n\n### Summary\n${summary}`;
+  }
+  if (context) {
+    system += `\n\n### Notes\n${context}`;
   }
 
   const messages: Array<{ role: string; content: string }> = [
     { role: 'system', content: system },
   ];
 
-  // Add recent history as proper alternating role messages
+  // Recent chat as proper alternating messages
   for (const msg of recentHistory) {
     messages.push({
       role: msg.role === 'user' ? 'user' : 'assistant',
@@ -671,46 +833,70 @@ function buildChatMessages(
     });
   }
 
-  // Current user message
-  messages.push({ role: 'user', content: userMessage });
+  // User query with grounding anchor at the bottom (dual-anchor pattern)
+  messages.push({
+    role: 'user',
+    content: `${rewrittenQuery}\n\n${GROUNDING_ANCHOR}`,
+  });
 
   return messages;
 }
 
-/** Detect bad output: repetition, empty, or loops */
-function validateOutput(text: string): boolean {
-  if (!text || text.trim().length < 2) return false;
+// ─── Anti-Loop Detection (8-token ngram, critical for Mistral 7B) ────────────
 
-  // Detect sentence-level repetition (same sentence 3+ times)
-  const sentences = text.split(/[.!?]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 10);
-  const seen = new Map<string, number>();
-  for (const s of sentences) {
-    seen.set(s, (seen.get(s) || 0) + 1);
-    if ((seen.get(s) || 0) >= 3) return false;
+function detectLoop(text: string): boolean {
+  if (text.length < 80) return false;
+
+  // Check for 8+ word sequences appearing 3+ times
+  const words = text.toLowerCase().split(/\s+/);
+  if (words.length < 24) return false;
+
+  const ngrams = new Map<string, number>();
+  for (let i = 0; i <= words.length - 8; i++) {
+    const gram = words.slice(i, i + 8).join(' ');
+    ngrams.set(gram, (ngrams.get(gram) || 0) + 1);
+    if ((ngrams.get(gram) || 0) >= 3) return true;
   }
-
-  // Detect phrase-level loops (20+ char substring repeated 3+ times)
-  const lower = text.toLowerCase();
-  for (let len = 20; len <= 60; len += 10) {
-    for (let i = 0; i <= lower.length - len; i += 10) {
-      const phrase = lower.slice(i, i + len);
-      let count = 0;
-      let pos = 0;
-      while ((pos = lower.indexOf(phrase, pos)) !== -1) { count++; pos += 1; }
-      if (count >= 3) return false;
-    }
-  }
-
-  return true;
+  return false;
 }
 
-/** Core chat call with proper format, penalties, and validation */
+// ─── Output Validation ───────────────────────────────────────────────────────
+
+function validateChatOutput(text: string, query: string, context: string): 'ok' | 'empty' | 'repetition' | 'off-topic' {
+  if (!text || text.trim().length < 5) return 'empty';
+  if (detectLoop(text)) return 'repetition';
+
+  // Check sentence-level repeats (same sentence 2+ times)
+  const sentences = text.split(/[.!?]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 15);
+  const seen = new Set<string>();
+  for (const s of sentences) {
+    if (seen.has(s)) return 'repetition';
+    seen.add(s);
+  }
+
+  // Off-topic check: response shares no significant words with query+context
+  if (query && context) {
+    const queryWords = new Set(query.toLowerCase().split(/\s+/).filter(w => w.length > 4));
+    const contextWords = new Set(context.toLowerCase().split(/\s+/).filter(w => w.length > 4).slice(0, 100));
+    const responseWords = text.toLowerCase().split(/\s+/).filter(w => w.length > 4);
+    const overlap = responseWords.filter(w => queryWords.has(w) || contextWords.has(w));
+    if (overlap.length === 0 && responseWords.length > 10) return 'off-topic';
+  }
+
+  return 'ok';
+}
+
+const FALLBACK_RESPONSE = "I couldn't find a clear answer in your notes. Try rephrasing your question.";
+
+// ─── Core Chat Call ──────────────────────────────────────────────────────────
+
+let chatTurnCounter = 0;
+
 async function callChat(
   systemPrompt: string,
-  context: string,
-  userMessage: string,
+  rawContext: string,
+  rawQuery: string,
   history: ChatMessage[],
-  maxTokens: number = CHAT_MAX_TOKENS,
 ): Promise<string> {
   await ensureLlamaRunning();
   await acquireInferenceLock();
@@ -718,16 +904,28 @@ async function callChat(
   const startTime = Date.now();
 
   try {
-    const { summary, recent } = windowHistory(history);
-    const messages = buildChatMessages(systemPrompt, context, summary, recent, userMessage);
+    chatTurnCounter++;
+    const { summary, recent, needsCacheReset } = await prepareHistory(history, chatTurnCounter);
+
+    if (needsCacheReset) {
+      console.log(`[Chat] KV cache reset at turn ${chatTurnCounter}`);
+      // Force fresh prompt rebuild — no stale KV cache
+      try {
+        await fetch(`${LLAMA_URL}/slots/0?action=erase`, { method: 'POST', signal: AbortSignal.timeout(2000) });
+      } catch {}
+    }
+
+    // Rewrite query to resolve coreferences
+    const rewrittenQuery = await rewriteQuery(rawQuery, recent);
+
+    // Compress context to fit token budget
+    const context = truncateToTokens(rawContext, TOKEN_BUDGET.context);
+
+    const messages = buildPromptMessages(systemPrompt, summary, context, recent, rewrittenQuery);
 
     const body = {
       messages,
-      temperature: CHAT_TEMPERATURE,
-      repeat_penalty: REPEAT_PENALTY,
-      presence_penalty: PRESENCE_PENALTY,
-      top_p: 0.9,
-      max_tokens: maxTokens,
+      ...CHAT_PARAMS,
       stream: false,
     };
 
@@ -739,12 +937,17 @@ async function callChat(
     if (!res.ok) throw new Error(`LLM error: ${res.status}`);
 
     const data = await res.json();
-    let response = data.choices?.[0]?.message?.content || '';
+    let response = (data.choices?.[0]?.message?.content || '').trim();
 
-    // Validate output — retry once if bad
-    if (!validateOutput(response)) {
-      console.warn('[Chat] Bad output detected (repetition/empty), retrying...');
-      const retryBody = { ...body, temperature: 0.8, repeat_penalty: 1.3 };
+    // Validate output
+    const validation = validateChatOutput(response, rewrittenQuery, context);
+    if (validation !== 'ok') {
+      console.warn(`[Chat] Validation failed: ${validation}. Retrying...`);
+      const retryBody = {
+        ...body,
+        temperature: Math.min(CHAT_PARAMS.temperature + 0.15, 0.5),
+        repeat_penalty: 1.25,
+      };
       const retryRes = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -752,11 +955,18 @@ async function callChat(
       });
       if (retryRes.ok) {
         const retryData = await retryRes.json();
-        response = retryData.choices?.[0]?.message?.content || response;
+        const retryResponse = (retryData.choices?.[0]?.message?.content || '').trim();
+        if (validateChatOutput(retryResponse, rewrittenQuery, context) === 'ok') {
+          response = retryResponse;
+        } else {
+          response = FALLBACK_RESPONSE;
+        }
+      } else {
+        response = FALLBACK_RESPONSE;
       }
     }
 
-    console.log(`[Chat] ${Date.now() - startTime}ms | turns=${history.length / 2} | summary=${summary ? 'yes' : 'no'}`);
+    console.log(`[Chat] ${Date.now() - startTime}ms | turn=${chatTurnCounter} | summary=${summary ? 'yes' : 'no'} | rewrite=${rewrittenQuery !== rawQuery}`);
     return response;
   } finally {
     recordInferenceTime(Date.now() - startTime);
@@ -764,13 +974,13 @@ async function callChat(
   }
 }
 
-/** Core streaming chat with anti-loop protection */
+// ─── Core Streaming Chat ─────────────────────────────────────────────────────
+
 async function* streamChat(
   systemPrompt: string,
-  context: string,
-  userMessage: string,
+  rawContext: string,
+  rawQuery: string,
   history: ChatMessage[],
-  maxTokens: number = CHAT_MAX_TOKENS,
 ): AsyncGenerator<string> {
   await ensureLlamaRunning();
   await acquireInferenceLock();
@@ -778,16 +988,22 @@ async function* streamChat(
   const startTime = Date.now();
 
   try {
-    const { summary, recent } = windowHistory(history);
-    const messages = buildChatMessages(systemPrompt, context, summary, recent, userMessage);
+    chatTurnCounter++;
+    const { summary, recent, needsCacheReset } = await prepareHistory(history, chatTurnCounter);
+
+    if (needsCacheReset) {
+      try {
+        await fetch(`${LLAMA_URL}/slots/0?action=erase`, { method: 'POST', signal: AbortSignal.timeout(2000) });
+      } catch {}
+    }
+
+    const rewrittenQuery = await rewriteQuery(rawQuery, recent);
+    const context = truncateToTokens(rawContext, TOKEN_BUDGET.context);
+    const messages = buildPromptMessages(systemPrompt, summary, context, recent, rewrittenQuery);
 
     const body = {
       messages,
-      temperature: CHAT_TEMPERATURE,
-      repeat_penalty: REPEAT_PENALTY,
-      presence_penalty: PRESENCE_PENALTY,
-      top_p: 0.9,
-      max_tokens: maxTokens,
+      ...CHAT_PARAMS,
       stream: true,
     };
 
@@ -804,7 +1020,6 @@ async function* streamChat(
     const decoder = new TextDecoder();
     let accumulated = '';
     let buffer = '';
-    let lastYielded = '';
 
     while (true) {
       const { done, value } = await reader.read();
@@ -825,14 +1040,15 @@ async function* streamChat(
           if (content) {
             accumulated += content;
 
-            // Anti-loop: detect if last 60 chars are repeating
-            if (accumulated.length > 120) {
-              const tail = accumulated.slice(-60);
-              const before = accumulated.slice(-120, -60);
-              if (tail === before) {
-                console.warn('[Chat] Loop detected in stream, stopping');
-                return;
-              }
+            // Anti-loop: 8-word ngram detection (critical for Mistral 7B)
+            if (detectLoop(accumulated)) {
+              console.warn('[Chat] Loop detected in stream at', accumulated.length, 'chars');
+              // Truncate at the clean boundary before the loop started
+              const words = accumulated.split(/\s+/);
+              const cleanEnd = Math.max(words.length - 16, Math.floor(words.length * 0.7));
+              accumulated = words.slice(0, cleanEnd).join(' ');
+              yield accumulated;
+              return;
             }
 
             yield accumulated;
@@ -846,7 +1062,7 @@ async function* streamChat(
   }
 }
 
-// ─── Public Chat API (drop-in replacements) ──────────────────────────────────
+// ─── Public Chat API ─────────────────────────────────────────────────────────
 
 export async function chatWithContext(
   documentText: string,
@@ -854,7 +1070,7 @@ export async function chatWithContext(
   history: ChatMessage[],
 ): Promise<string> {
   const context = cleanInputText(documentText);
-  return callChat(CHAT_SYSTEM_PROMPT, context, userMessage, history);
+  return callChat(CHAT_SYSTEM, context, userMessage, history);
 }
 
 export async function* chatWithContextStream(
@@ -863,7 +1079,7 @@ export async function* chatWithContextStream(
   history: ChatMessage[],
 ): AsyncGenerator<string> {
   const context = cleanInputText(documentText);
-  yield* streamChat(CHAT_SYSTEM_PROMPT, context, userMessage, history);
+  yield* streamChat(CHAT_SYSTEM, context, userMessage, history);
 }
 
 export async function chatWithRAG(
@@ -871,8 +1087,8 @@ export async function chatWithRAG(
   userMessage: string,
   history: ChatMessage[],
 ): Promise<string> {
-  const context = chunks.map((c, i) => `[Passage ${i + 1}]\n${c}`).join('\n\n');
-  return callChat(RAG_SYSTEM_PROMPT, context, userMessage, history);
+  const context = compressContext(chunks, TOKEN_BUDGET.context);
+  return callChat(RAG_SYSTEM, context, userMessage, history);
 }
 
 export async function* chatWithRAGStream(
@@ -880,8 +1096,8 @@ export async function* chatWithRAGStream(
   userMessage: string,
   history: ChatMessage[],
 ): AsyncGenerator<string> {
-  const context = chunks.map((c, i) => `[Passage ${i + 1}]\n${c}`).join('\n\n');
-  yield* streamChat(RAG_SYSTEM_PROMPT, context, userMessage, history);
+  const context = compressContext(chunks, TOKEN_BUDGET.context);
+  yield* streamChat(RAG_SYSTEM, context, userMessage, history);
 }
 
 function estimateTokens(text: string): number {
