@@ -306,11 +306,3 @@ body {
   to { opacity: 1; }
 }
 
-/* Exit — fast opacity fade */
-html.app-closing body {
-  animation: epito-out 0.15s ease-in forwards !important;
-}
-
-@keyframes epito-out {
-  to { opacity: 0; }
-}

@@ -252,34 +252,6 @@ fn check_node_binary(path: &std::path::Path) -> Option<String> {
     Some(normalize_windows_path(path).to_string_lossy().to_string())
 }
 
-/// Exit animation injected via window.eval when the user closes the app.
-/// Self-contained — doesn't need React. Plays in ~800ms.
-/// Sequence: UI fades out → "Epito" appears → "pito" dissolves → "E" shrinks → fade to black
-const EXIT_ANIMATION_JS: &str = r#"
-(function(){
-  var bg = getComputedStyle(document.documentElement).getPropertyValue('--background') || '240 10% 3.9%';
-  var fg = getComputedStyle(document.documentElement).getPropertyValue('--foreground') || '0 0% 98%';
-  var pr = getComputedStyle(document.documentElement).getPropertyValue('--primary') || '221 83% 53%';
-  var d = document.createElement('div');
-  d.innerHTML = '<style>'
-    + '.exit-overlay{position:fixed;inset:0;z-index:999999;display:flex;align-items:center;justify-content:center;background:hsl('+bg+');}'
-    + '.exit-overlay .ew{font:700 40px/1 -apple-system,BlinkMacSystemFont,system-ui,sans-serif;color:hsl('+fg+');letter-spacing:-0.02em;display:flex;user-select:none;opacity:0;animation:exi 0.15s ease-out forwards}'
-    + '.exit-overlay .ew span{display:inline-block}'
-    + '.exit-overlay .ew .ep{animation:exd 0.2s ease-in 0.25s forwards}'
-    + '@keyframes exi{to{opacity:1}}'
-    + '@keyframes exd{to{opacity:0;transform:translateX(3px)}}'
-    + '.exit-overlay .ew .ee{animation:exs 0.2s ease-in 0.5s forwards}'
-    + '@keyframes exs{to{opacity:0;transform:scale(0.5)}}'
-    + '</style>'
-    + '<div class="exit-overlay"><div class="ew">'
-    + '<span class="ee">E</span><span class="ep">p</span><span class="ep">i</span><span class="ep">t</span><span class="ep">o</span>'
-    + '</div></div>';
-  document.body.style.opacity='0';
-  document.body.style.transition='opacity 0.12s ease';
-  document.body.appendChild(d);
-})();
-"#;
-
 pub(crate) fn normalize_windows_path(path: &std::path::Path) -> std::path::PathBuf {
     let resolved = path.canonicalize().unwrap_or(path.to_path_buf());
     #[cfg(windows)]
@@ -738,23 +710,10 @@ pub fn run() {
         .run(|app_handle, event| {
             match event {
                 tauri::RunEvent::WindowEvent {
-                    label, event: tauri::WindowEvent::CloseRequested { api, .. }, ..
+                    label, event: tauri::WindowEvent::CloseRequested { .. }, ..
                 } => {
                     if label == "main" {
-                        api.prevent_close();
-                        let h = app_handle.clone();
-                        if let Some(window) = app_handle.get_webview_window("main") {
-                            // Inject exit animation directly (React is unmounting, can't render components)
-                            let _ = window.eval(EXIT_ANIMATION_JS);
-                            let w = window.clone();
-                            thread::spawn(move || { perform_shutdown(&h); });
-                            thread::spawn(move || {
-                                thread::sleep(Duration::from_millis(800));
-                                let _ = w.destroy();
-                            });
-                        } else {
-                            perform_shutdown(&h);
-                        }
+                        perform_shutdown(app_handle);
                     }
                 }
                 tauri::RunEvent::Exit => {
