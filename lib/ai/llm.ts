@@ -1,4 +1,4 @@
-import { tryAnswer } from './answer-engine';
+import { extractFocusedContext } from './answer-engine';
 
 const LLAMA_PORT = process.env.LLAMA_SERVER_PORT || '8080';
 const LLAMA_URL = `http://127.0.0.1:${LLAMA_PORT}`;
@@ -1253,24 +1253,23 @@ async function chatPipeline(
       context = truncTk(rawContext, TOKEN_BUDGET.context);
     }
 
-    // ── Answer Engine: try code-based extraction BEFORE calling the model ──
-    // Research (arxiv 2603.11513): 7B models extract correct answers only
-    // 14.6% of the time. Code extraction is deterministic and reliable.
+    // ── Focused Context Extraction ──────────────────────────────────────
+    // Instead of sending full chunks (which 7B models ignore 85% of the time),
+    // find query terms in chunks and extract 100 words around each match.
+    // The model gets ONLY the relevant surrounding text.
     const allChunks = isRAG && chunks ? chunks : context ? [context] : [];
-    const engineResult = tryAnswer(rawQuery, allChunks);
-    if (engineResult && engineResult.skipModel) {
-      console.log(`[Chat] Answer engine: code-based answer (skipped model)`);
-      recentResponses.push(engineResult.answer);
-      if (recentResponses.length > 5) recentResponses.shift();
-      return engineResult.answer;
+    const extraction = extractFocusedContext(rawQuery, allChunks);
+
+    // If extraction found a direct answer (e.g. for list queries), return it
+    if (extraction.directAnswer) {
+      console.log(`[Chat] Direct code answer (${extraction.matchCount} matches)`);
+      return extraction.directAnswer;
     }
 
-    // If engine returned a tiny prompt, use it as context instead of full chunks
-    let effectiveContext = context;
-    if (engineResult && !engineResult.skipModel) {
-      effectiveContext = engineResult.tinyPrompt;
-      console.log(`[Chat] Answer engine: condensed context (${effectiveContext.length} chars)`);
-    }
+    // Use focused context (term matches + surrounding words) instead of full chunks
+    const effectiveContext = extraction.matchCount > 0
+      ? extraction.focusedContext
+      : context; // fall back to full context if no terms matched
 
     // Step 6: Prompt assembly
     const flags = { frustrated, isCorrection, intent };
@@ -1402,18 +1401,17 @@ async function* streamPipeline(
 
     let context = isRAG && chunks ? compressChunks(chunks, TOKEN_BUDGET.context, excludedEntities) : truncTk(rawContext, TOKEN_BUDGET.context);
 
-    // Answer engine interception (same as non-streaming pipeline)
-    const allChunksStream = isRAG && chunks ? chunks : context ? [context] : [];
-    const engineResultStream = tryAnswer(rawQuery, allChunksStream);
-    if (engineResultStream && engineResultStream.skipModel) {
-      console.log(`[Chat] Answer engine (stream): code-based answer`);
-      yield engineResultStream.answer;
-      recentResponses.push(engineResultStream.answer);
-      if (recentResponses.length > 5) recentResponses.shift();
+    // Focused context extraction (same as sync pipeline)
+    const allChunksS = isRAG && chunks ? chunks : context ? [context] : [];
+    const extractionS = extractFocusedContext(rawQuery, allChunksS);
+
+    if (extractionS.directAnswer) {
+      yield extractionS.directAnswer;
       return;
     }
-    if (engineResultStream && !engineResultStream.skipModel) {
-      context = engineResultStream.tinyPrompt;
+
+    if (extractionS.matchCount > 0) {
+      context = extractionS.focusedContext;
     }
 
     const flags = { frustrated, isCorrection, intent };

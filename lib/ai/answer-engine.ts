@@ -1,87 +1,16 @@
 /**
- * Answer Engine — code-based extraction layer that sits between retrieval and the model.
+ * Answer Engine — dynamic context extraction layer.
  *
- * For every user query:
- *   1. Tries to answer from chunks using code (regex, keyword matching)
- *   2. If code finds the answer → returns it directly, model is never called
- *   3. If code can't answer → returns null, model handles it as normal
+ * Instead of hardcoded entity patterns, this:
+ *   1. Extracts key terms from the user's query
+ *   2. Finds every occurrence of those terms in the chunks
+ *   3. Reads 100 words before and after each match
+ *   4. Deduplicates overlapping excerpts
+ *   5. Returns these focused excerpts as the prompt context
  *
- * This fixes the documented Mistral 7B failure where the model receives correct
- * chunks but says "not found" or ignores them (arxiv 2603.11513: 7B models
- * extract correct answers only 14.6% of the time even with oracle retrieval).
+ * The model gets ONLY the relevant surrounding text, not entire chunks.
+ * Less noise = the model actually reads it.
  */
-
-// ─── Entity Pattern Registry ─────────────────────────────────────────────────
-
-const ENTITY_PATTERNS: Record<string, RegExp[]> = {
-  university: [
-    /[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+University(?:\s+(?:of|in|for)\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*/g,
-    /University\s+of\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g,
-    /[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+Institute\s+of\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g,
-    /[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+(?:Defence|Defense)\s+University/g,
-    /\bMIT\b/g,
-    /\bIIT\s+[A-Z][a-z]+/g,
-  ],
-  college: [
-    /[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\s+College(?:\s+of\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)*/g,
-  ],
-  tool: [
-    /\bBeautifulSoup\b/g, /\bScrapy\b/g, /\bSelenium\b/g, /\blxml\b/g,
-    /\bMechanicalSoup\b/g, /\bFlask\b/g, /\bMongoDB\b/g, /\bDjango\b/g,
-    /\bPyTorch\b/g, /\bTensorFlow\b/g, /\bKeras\b/g, /\bNumPy\b/g,
-    /\bPandas\b/g, /\bScikit-learn\b/g, /\bOpenCV\b/g,
-    /\brequests\b/g, /\bUrllib3?\b/g,
-  ],
-  person: [
-    /[A-Z][a-z]{1,15}\s+(?:[A-Z]\.?\s+)?[A-Z][a-z]{1,15}(?:\s+[A-Z][a-z]{1,15})?/g,
-  ],
-  reference: [
-    /\[\d+\]/g,
-  ],
-};
-
-const QUERY_TO_ENTITY: Record<string, string[]> = {
-  university: ['university', 'universities', 'college', 'colleges', 'institute', 'institutes', 'school', 'schools', 'institution', 'institutions'],
-  tool: ['tool', 'tools', 'library', 'libraries', 'framework', 'frameworks', 'software', 'scraper', 'scrapers', 'technology', 'technologies'],
-  person: ['author', 'authors', 'who wrote', 'who is', 'who are', 'person', 'people', 'researcher', 'researchers'],
-  reference: ['reference', 'references', 'citation', 'citations', 'bibliography'],
-};
-
-// ─── Core Functions ──────────────────────────────────────────────────────────
-
-function combineChunks(chunks: string[]): string {
-  return chunks.join(' ');
-}
-
-function scanChunks(chunks: string[], patterns: RegExp[]): string[] {
-  const combined = combineChunks(chunks);
-  const found = new Map<string, string>(); // lowercase → original
-
-  for (const pattern of patterns) {
-    // Reset lastIndex for global regexes
-    pattern.lastIndex = 0;
-    let m;
-    while ((m = pattern.exec(combined)) !== null) {
-      const text = m[0].trim().replace(/[,.]$/, '');
-      if (text.length > 3) {
-        const key = text.toLowerCase();
-        if (!found.has(key)) found.set(key, text);
-      }
-    }
-  }
-
-  return [...found.values()];
-}
-
-function detectEntityType(query: string): string | null {
-  const q = query.toLowerCase();
-  for (const [entityType, keywords] of Object.entries(QUERY_TO_ENTITY)) {
-    for (const kw of keywords) {
-      if (q.includes(kw)) return entityType;
-    }
-  }
-  return null;
-}
 
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'is', 'are', 'was', 'were', 'what', 'which', 'who',
@@ -89,140 +18,216 @@ const STOP_WORDS = new Set([
   'for', 'of', 'and', 'or', 'this', 'that', 'all', 'any', 'my', 'your',
   'me', 'it', 'they', 'be', 'been', 'have', 'has', 'had', 'not', 'can',
   'could', 'will', 'would', 'with', 'from', 'by', 'about', 'into',
-  'give', 'tell', 'listed', 'mentioned', 'named', 'written', 'here',
+  'give', 'tell', 'list', 'listed', 'mentioned', 'named', 'written',
+  'here', 'there', 'some', 'many', 'much', 'more', 'most', 'other',
+  'than', 'then', 'also', 'just', 'but', 'if', 'so', 'no', 'yes',
+  'i', 'you', 'we', 'he', 'she', 'its', 'them', 'their', 'our',
+  'been', 'being', 'may', 'might', 'must', 'shall', 'should', 'need',
+  'up', 'out', 'off', 'over', 'only', 'very', 'such', 'like',
+  'what', 'name', 'names', 'please', 'paper', 'note', 'notes',
 ]);
 
-function findRelevantSentences(query: string, chunks: string[], maxSentences = 5): string[] {
-  const combined = combineChunks(chunks);
-  const sentences = combined.split(/(?<=[.!?])\s+/).filter(s => s.trim().length > 10);
+// ─── Extract Key Terms from Query ────────────────────────────────────────────
 
-  const queryWords = new Set(
-    query.toLowerCase().split(/\s+/).filter(w => w.length > 2 && !STOP_WORDS.has(w))
-  );
+function extractQueryTerms(query: string): string[] {
+  const words = query.toLowerCase()
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !STOP_WORDS.has(w));
 
-  const scored: [number, string][] = [];
-  for (const sentence of sentences) {
-    const sLower = sentence.toLowerCase();
-    let overlap = 0;
-    for (const w of queryWords) {
-      if (sLower.includes(w)) overlap++;
+  // Also extract multi-word phrases (2-3 word ngrams that appear as-is)
+  const cleaned = query.toLowerCase().replace(/[^\w\s]/g, ' ');
+  const allWords = cleaned.split(/\s+/).filter(w => w.length > 0);
+  const phrases: string[] = [];
+
+  for (let i = 0; i < allWords.length - 1; i++) {
+    const bigram = `${allWords[i]} ${allWords[i + 1]}`;
+    if (!STOP_WORDS.has(allWords[i]) || !STOP_WORDS.has(allWords[i + 1])) {
+      phrases.push(bigram);
     }
-    if (overlap > 0) scored.push([overlap, sentence.trim()]);
+    if (i < allWords.length - 2) {
+      const trigram = `${allWords[i]} ${allWords[i + 1]} ${allWords[i + 2]}`;
+      phrases.push(trigram);
+    }
   }
 
-  scored.sort((a, b) => b[0] - a[0]);
-  return scored.slice(0, maxSentences).map(s => s[1]);
+  // Return unique terms, longest first (phrases before single words)
+  const all = [...new Set([...phrases, ...words])];
+  all.sort((a, b) => b.length - a.length);
+  return all;
 }
 
-// ─── Main Function ───────────────────────────────────────────────────────────
+// ─── Find Matches + Surrounding Context ──────────────────────────────────────
 
-export type AnswerResult = {
-  answer: string;
-  skipModel: true;
-} | {
-  tinyPrompt: string;
-  skipModel: false;
-} | null;
+interface ContextMatch {
+  term: string;
+  position: number;
+  excerpt: string; // 100 words before + match + 100 words after
+}
 
-export function tryAnswer(query: string, chunks: string[]): AnswerResult {
+function findMatchesWithContext(
+  text: string,
+  terms: string[],
+  windowWords: number = 100,
+): ContextMatch[] {
+  const textLower = text.toLowerCase();
+  const words = text.split(/\s+/);
+  const matches: ContextMatch[] = [];
+  const coveredRanges: [number, number][] = []; // prevent overlapping excerpts
+
+  for (const term of terms) {
+    let searchFrom = 0;
+
+    while (true) {
+      const pos = textLower.indexOf(term, searchFrom);
+      if (pos === -1) break;
+      searchFrom = pos + term.length;
+
+      // Convert character position to word index
+      const charsBefore = text.slice(0, pos);
+      const wordIdx = charsBefore.split(/\s+/).length - 1;
+
+      // Check if this position overlaps with an already-extracted region
+      const start = Math.max(0, wordIdx - windowWords);
+      const end = Math.min(words.length, wordIdx + windowWords);
+
+      const overlaps = coveredRanges.some(
+        ([cs, ce]) => start < ce && end > cs
+      );
+
+      if (!overlaps) {
+        const excerpt = words.slice(start, end).join(' ');
+        matches.push({ term, position: pos, excerpt });
+        coveredRanges.push([start, end]);
+      }
+    }
+  }
+
+  // Sort by position in document (preserve reading order)
+  matches.sort((a, b) => a.position - b.position);
+  return matches;
+}
+
+// ─── Count Occurrences ───────────────────────────────────────────────────────
+
+function countOccurrences(text: string, term: string): number {
+  const lower = text.toLowerCase();
+  const t = term.toLowerCase();
+  let count = 0;
+  let pos = 0;
+  while ((pos = lower.indexOf(t, pos)) !== -1) {
+    count++;
+    pos += t.length;
+  }
+  return count;
+}
+
+// ─── Main: Extract Focused Context ───────────────────────────────────────────
+
+export interface ExtractionResult {
+  /** The focused excerpts to use as context (replaces full chunks) */
+  focusedContext: string;
+  /** Number of unique term matches found */
+  matchCount: number;
+  /** The terms that were found */
+  matchedTerms: string[];
+  /** Whether enough was found to skip the model entirely */
+  directAnswer: string | null;
+}
+
+export function extractFocusedContext(
+  query: string,
+  chunks: string[],
+): ExtractionResult {
   if (!chunks || chunks.length === 0) {
-    return { answer: "I don't have any notes to search through. Add some notes first!", skipModel: true };
+    return { focusedContext: '', matchCount: 0, matchedTerms: [], directAnswer: null };
   }
 
-  const qLower = query.toLowerCase();
+  const combined = chunks.join('\n\n');
+  const terms = extractQueryTerms(query);
 
-  // ─── List/Extraction Queries ───────────────────────────────────────────
-  const entityType = detectEntityType(query);
-  if (entityType && ENTITY_PATTERNS[entityType]) {
-    const isListQuery = /\b(list|all|every|name|names|what are|how many|which|mentioned|written|given|stated)\b/i.test(qLower);
-
-    if (isListQuery || entityType === 'university') {
-      let patterns = [...ENTITY_PATTERNS[entityType]];
-      if (entityType === 'university') {
-        patterns = [...patterns, ...(ENTITY_PATTERNS.college || [])];
-      }
-
-      const results = scanChunks(chunks, patterns);
-
-      if (results.length > 0) {
-        const label: Record<string, string> = {
-          university: 'Universities/institutions',
-          college: 'Colleges',
-          tool: 'Tools/libraries',
-          person: 'People/authors',
-          reference: 'References',
-        };
-        const lines = results.map((item, i) => `${i + 1}. ${item}`);
-        return {
-          answer: `${label[entityType] || 'Items'} mentioned in your notes:\n${lines.join('\n')}`,
-          skipModel: true,
-        };
-      }
-    }
-  }
-
-  // ─── "Who is X" Queries ────────────────────────────────────────────────
-  const whoMatch = qLower.match(/who (?:is|are|was) (.+?)(?:\?|$)/);
-  if (whoMatch) {
-    const personName = whoMatch[1].trim();
-    const sentences = findRelevantSentences(personName, chunks, 8);
-    if (sentences.length > 0) {
-      return {
-        answer: `Here's what your notes say about ${personName}:\n\n${sentences.slice(0, 5).join(' ')}`,
-        skipModel: true,
-      };
-    }
-    return { answer: `I couldn't find information about ${personName} in your notes.`, skipModel: true };
-  }
-
-  // ─── Yes/No Queries ────────────────────────────────────────────────────
-  if (/^(is|are|does|do|was|were|did|has|have|can)\s/i.test(qLower)) {
-    const keyTerms = query.split(/\s+/).slice(1).filter(w => w.length > 3 && !STOP_WORDS.has(w.toLowerCase()));
-    const combined = combineChunks(chunks).toLowerCase();
-    const matches = keyTerms.filter(t => combined.includes(t.toLowerCase()));
-    if (matches.length > 0) {
-      const evidence = findRelevantSentences(query, chunks, 2);
-      const evText = evidence.length > 0 ? ' ' + evidence[0].slice(0, 200) : '';
-      return { answer: `Yes.${evText}`, skipModel: true };
-    }
-    return { answer: 'Based on your notes, no.', skipModel: true };
-  }
-
-  // ─── "What is X" Queries ───────────────────────────────────────────────
-  const whatMatch = qLower.match(/what (?:is|are|was|were) (.+?)(?:\?|$)/);
-  if (whatMatch) {
-    const topic = whatMatch[1].trim();
-    const sentences = findRelevantSentences(topic, chunks, 5);
-    if (sentences.length > 0) {
-      return { answer: sentences.slice(0, 3).join(' '), skipModel: true };
-    }
-  }
-
-  // ─── Comparison Queries ────────────────────────────────────────────────
-  if (/\b(compare|vs|versus|difference|better|faster|which is)\b/i.test(qLower)) {
-    const sentences = findRelevantSentences(query, chunks, 8);
-    if (sentences.length > 0) {
-      return { answer: sentences.join(' '), skipModel: true };
-    }
-  }
-
-  // ─── Numerical Queries ─────────────────────────────────────────────────
-  if (/\b(how many|average|total|count|percentage|rate|runtime)\b/i.test(qLower)) {
-    const sentences = findRelevantSentences(query, chunks, 5);
-    if (sentences.length > 0) {
-      return { answer: sentences.slice(0, 3).join(' '), skipModel: true };
-    }
-  }
-
-  // ─── Fallback: Condense chunks to relevant sentences for model ─────────
-  const relevant = findRelevantSentences(query, chunks, 5);
-  if (relevant.length > 0) {
+  if (terms.length === 0) {
+    // No meaningful terms extracted — return first 500 words as context
+    const words = combined.split(/\s+/);
     return {
-      tinyPrompt: relevant.join(' '),
-      skipModel: false,
+      focusedContext: words.slice(0, 500).join(' '),
+      matchCount: 0,
+      matchedTerms: [],
+      directAnswer: null,
     };
   }
 
-  // Nothing found at all
-  return null;
+  // Find which terms actually appear in the text
+  const foundTerms: string[] = [];
+  const termCounts = new Map<string, number>();
+
+  for (const term of terms) {
+    const count = countOccurrences(combined, term);
+    if (count > 0) {
+      // Avoid adding a single word if a phrase containing it is already found
+      const alreadyCovered = foundTerms.some(
+        ft => ft.length > term.length && ft.includes(term)
+      );
+      if (!alreadyCovered) {
+        foundTerms.push(term);
+        termCounts.set(term, count);
+      }
+    }
+  }
+
+  if (foundTerms.length === 0) {
+    return { focusedContext: '', matchCount: 0, matchedTerms: [], directAnswer: null };
+  }
+
+  // Extract context windows around each match
+  const matches = findMatchesWithContext(combined, foundTerms, 100);
+  const totalMatches = foundTerms.reduce((sum, t) => sum + (termCounts.get(t) || 0), 0);
+
+  // Build focused context from excerpts
+  let focusedContext: string;
+  if (matches.length === 0) {
+    // Terms exist but no non-overlapping windows (very short text)
+    focusedContext = combined;
+  } else {
+    focusedContext = matches.map((m, i) => `[${i + 1}] ${m.excerpt}`).join('\n\n');
+  }
+
+  // For list queries, count unique instances
+  const isListQuery = /\b(list|all|every|how many|what are|which|mentioned|name)\b/i.test(query.toLowerCase());
+
+  let directAnswer: string | null = null;
+
+  if (isListQuery && foundTerms.length > 0) {
+    // For list queries, collect ALL unique multi-word entities near the matched terms
+    // This catches things like university names, person names, tool names
+    const entitySet = new Set<string>();
+
+    for (const match of matches) {
+      // Extract capitalized multi-word phrases from each excerpt
+      const entityRe = /[A-Z][a-z]+(?:\s+(?:[A-Z][a-z]+|of|the|and|for|in|de|du|von|van))*\s+[A-Z][a-z]+/g;
+      let m;
+      while ((m = entityRe.exec(match.excerpt)) !== null) {
+        const entity = m[0].trim();
+        if (entity.length > 5) entitySet.add(entity);
+      }
+    }
+
+    if (entitySet.size > 1) {
+      const items = [...entitySet].map((e, i) => `${i + 1}. ${e}`);
+      directAnswer = `Found ${entitySet.size} items in your notes:\n${items.join('\n')}`;
+    }
+  }
+
+  console.log(
+    `[AnswerEngine] Query: "${query}" | Terms: [${foundTerms.slice(0, 5).join(', ')}] | ` +
+    `Matches: ${totalMatches} | Excerpts: ${matches.length} | ` +
+    `Context: ${focusedContext.split(/\s+/).length} words`
+  );
+
+  return {
+    focusedContext,
+    matchCount: totalMatches,
+    matchedTerms: foundTerms,
+    directAnswer,
+  };
 }
