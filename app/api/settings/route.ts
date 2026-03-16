@@ -1,4 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import * as db from '@/lib/database';
 import { checkLlamaConnection } from '@/lib/ai/llm';
 
@@ -35,6 +38,12 @@ export async function PUT(request: NextRequest) {
       return NextResponse.json({ error: 'Invalid theme value' }, { status: 400 });
     }
     db.setSetting('theme', body.theme);
+    // Write theme file for Rust splash screen to read at next startup
+    try {
+      const themeDir = path.join(os.homedir(), '.epito');
+      fs.mkdirSync(themeDir, { recursive: true });
+      fs.writeFileSync(path.join(themeDir, 'theme'), body.theme);
+    } catch {}
   }
 
   // PUT /api/settings with { key: "note-order", value: [...] }

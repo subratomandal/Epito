@@ -80,7 +80,19 @@ export default function HomePage() {
     fetchDeletedNotes();
 
     const savedTheme = localStorage.getItem('theme') as 'light' | 'dark' | null;
-    if (savedTheme) setTheme(savedTheme);
+    if (savedTheme) {
+      setTheme(savedTheme);
+      fetch('/api/settings', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ theme: savedTheme }),
+      }).catch(() => {});
+      // Match titlebar color to theme on startup
+      try {
+        const t = (window as any).__TAURI_INTERNALS__;
+        if (t?.invoke) t.invoke('set_theme_color', { theme: savedTheme }).catch(() => {});
+      } catch {}
+    }
   }, [fetchAll, fetchDeletedNotes]);
 
   const selectedNoteRef = useRef(selectedNote);
@@ -361,6 +373,11 @@ export default function HomePage() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ theme: newTheme }),
     }).catch(() => {});
+    // Update titlebar color to match theme (Tauri transparent titlebar)
+    try {
+      const t = (window as any).__TAURI_INTERNALS__;
+      if (t?.invoke) t.invoke('set_theme_color', { theme: newTheme }).catch(() => {});
+    } catch {}
   }, []);
 
   useEffect(() => {

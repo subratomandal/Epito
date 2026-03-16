@@ -98,7 +98,7 @@ export default function StartupScreen({ onReady }: { onReady: () => void }) {
   return (
     <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-background">
       <div className="flex flex-col items-center gap-6 max-w-md px-8 text-center">
-        <h1 className="text-3xl font-bold text-foreground tracking-tight">Epito</h1>
+        {/* App title removed from startup */}
 
         {downloading && (
           <div className="flex flex-col items-center gap-4 w-full">

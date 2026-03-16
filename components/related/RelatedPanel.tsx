@@ -72,6 +72,12 @@ function cleanExplainText(text: string): string {
 
 function cleanChatText(text: string): string {
   return text
+    .replace(/<\/s>/g, '')
+    .replace(/<\|im_end\|>/g, '')
+    .replace(/<\|endoftext\|>/g, '')
+    .replace(/<\|end\|>/g, '')
+    .replace(/\[INST\][\s\S]*?\[\/INST\]/g, '')
+    .replace(/\b(terminated|Terminated)\s*\.?\s*$/i, '')
     .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
     .replace(/_{1,3}([^_]+)_{1,3}/g, '$1')
     .replace(/`{1,3}([^`]+)`{1,3}/g, '$1')
@@ -145,6 +151,18 @@ interface StreamRetrievalData {
   sources: ChatSource[];
 }
 
+interface BlockSummaryEvent {
+  summary: string;
+  blockIndex: number;
+  totalBlocks: number;
+}
+
+interface BlockStreamEvent {
+  text: string;
+  blockIndex: number;
+  totalBlocks: number;
+}
+
 async function readStream(
   response: Response,
   onChunk: (text: string) => void,
@@ -152,6 +170,8 @@ async function readStream(
   onError?: (msg: string) => void,
   signal?: AbortSignal,
   onRetrieval?: (data: StreamRetrievalData) => void,
+  onBlockSummary?: (event: BlockSummaryEvent) => void,
+  onBlockStream?: (event: BlockStreamEvent) => void,
 ): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) return '';
@@ -196,6 +216,20 @@ async function readStream(
             if (parsed.retrieval && onRetrieval) {
               onRetrieval(parsed.retrieval as StreamRetrievalData);
             }
+            if (parsed.blockDone && onBlockSummary) {
+              onBlockSummary({
+                summary: parsed.blockDone,
+                blockIndex: parsed.blockIndex ?? 0,
+                totalBlocks: parsed.totalBlocks ?? 1,
+              });
+            }
+            if (parsed.blockStream && onBlockStream) {
+              onBlockStream({
+                text: parsed.blockStream,
+                blockIndex: parsed.blockIndex ?? 0,
+                totalBlocks: parsed.totalBlocks ?? 1,
+              });
+            }
           } catch {}
         }
       }
@@ -207,6 +241,38 @@ async function readStream(
     throw err;
   }
   return fullText;
+}
+
+// ─── Skeleton Loading ─────────────────────────────────────────────────────────
+
+function SkeletonBlock({ lines = 3, message }: { lines?: number; message?: string }) {
+  return (
+    <div className="py-1.5 space-y-1.5">
+      {message && (
+        <span className="text-[10px] text-muted-foreground/50">{message}</span>
+      )}
+      {Array.from({ length: lines }).map((_, i) => (
+        <div
+          key={i}
+          className="h-[9px] rounded-sm bg-muted/50"
+          style={{
+            width: i === lines - 1 ? '55%' : i === 0 ? '90%' : '100%',
+            animation: `skeletonPulse 1.6s ease-in-out ${i * 0.12}s infinite`,
+          }}
+        />
+      ))}
+      <style>{`
+        @keyframes skeletonPulse {
+          0%, 100% { opacity: 0.45; }
+          50% { opacity: 0.15; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+function EpitoThinkingAnimation({ message }: { message?: string }) {
+  return <SkeletonBlock lines={3} message={message} />;
 }
 
 interface ChatSource {
@@ -586,9 +652,96 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
     }
   }, [saveCacheResult]);
 
+  // Refs to hold block state across batch requests
+  const blocksRef = useRef<string[]>([]);
+  const blockSummariesRef = useRef<string[]>([]);
+  const batchStartRef = useRef(0);
+
+  // Process exactly 3 blocks via backend, then stop completely
+  const runBatch = useCallback(async (startIdx: number) => {
+    const docId = noteIdRef.current;
+    const signal = abortRef.current.signal;
+    setSummaryPhase('streaming');
+    setProgressMsg('');
+
+    try {
+      const res = await fetch('/api/ai/stream', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'summarize-batch',
+          blocks: blocksRef.current,
+          startIdx,
+          batchSize: 3,
+          previousBlockSummaries: blockSummariesRef.current,
+        }),
+        signal,
+      });
+      if (noteIdRef.current !== docId || !res.ok) return;
+
+      await readStream(res, () => {},
+        (msg) => { if (noteIdRef.current === docId) setProgressMsg(msg); },
+        undefined, signal, undefined,
+        // onBlockDone — block finished, add to completed list
+        (event) => {
+          if (noteIdRef.current !== docId) return;
+          blockSummariesRef.current = [...blockSummariesRef.current, event.summary];
+          setSectionSummaries([...blockSummariesRef.current]);
+          setCurrentSectionIdx(event.blockIndex);
+          setCurrentStreamText('');
+          setProgressMsg('');
+        },
+        // onBlockStream — typing animation for current block
+        (event) => {
+          if (noteIdRef.current !== docId) return;
+          setCurrentStreamText(event.text);
+          setCurrentSectionIdx(event.blockIndex);
+          setProgressMsg('');
+        },
+      );
+
+      if (noteIdRef.current !== docId) return;
+      batchStartRef.current = startIdx + 3;
+
+      if (batchStartRef.current >= blocksRef.current.length) {
+        // All blocks done — run final synthesis
+        setSummaryPhase('merging');
+        setCurrentStreamText('');
+        const synthRes = await fetch('/api/ai/stream', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'summarize-final', allBlockSummaries: blockSummariesRef.current }),
+          signal,
+        });
+        if (noteIdRef.current !== docId || !synthRes.ok) return;
+        let final = '';
+        await readStream(synthRes,
+          (t) => { if (noteIdRef.current === docId) { final = t; setCurrentStreamText(t); } },
+          (msg) => { if (noteIdRef.current === docId) setProgressMsg(msg); },
+          undefined, signal,
+        );
+        if (noteIdRef.current !== docId) return;
+        setMergedSummary(final);
+        setCurrentStreamText('');
+        setSummaryPhase('merged');
+      } else {
+        // More blocks remain — STOP. Show Continue button.
+        setSummaryPhase('section-done');
+        setProgressMsg('');
+      }
+    } catch (err: unknown) {
+      if (err instanceof DOMException && err.name === 'AbortError') return;
+      setSummaryPhase('all-done');
+    }
+  }, []);
+
+  // Continue button handler — resumes the next batch
+  const handleContinue = useCallback(() => {
+    runBatch(batchStartRef.current);
+  }, [runBatch]);
+
   const runSummarize = useCallback(async (hardRefresh = false) => {
     if (!noteId || !hasContent) return;
-
     const docId = noteId;
     const signal = abortRef.current.signal;
 
@@ -603,6 +756,9 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
     setShowAllPoints({});
     setCopiedField(null);
     setProgressMsg('');
+    blocksRef.current = [];
+    blockSummariesRef.current = [];
+    batchStartRef.current = 0;
 
     const inputText = plainText.slice(0, 30000);
 
@@ -617,211 +773,136 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
         if (noteIdRef.current !== docId) return;
       }
 
-      const prepRes = await fetch('/api/ai/cache', {
+      // Ask backend: short note (direct summary) or long note (returns blocks)
+      const res = await fetch('/api/ai/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'prepare-summary', sourceId: noteId, text: inputText }),
+        body: JSON.stringify({ action: 'summarize', text: inputText, sourceId: noteId }),
         signal,
       });
-
-      if (noteIdRef.current !== docId) return;
-
-      const prepData = await prepRes.json();
-
-      if (prepData.error) {
-        if (noteIdRef.current !== docId) return;
-        setSectionSummaries([prepData.error]);
+      if (noteIdRef.current !== docId || !res.ok) {
+        setSectionSummaries(['Failed to start summarization.']);
         setSummaryPhase('all-done');
         return;
       }
 
-      const chunkData: { cacheId: string; text: string; summary: string | null; cached: boolean }[] = prepData.chunks || [];
-      if (chunkData.length === 0) {
-        if (noteIdRef.current !== docId) return;
-        setSummaryPhase('idle');
-        return;
-      }
+      // Parse response — could be { blocks: [...] } or streaming text
+      let gotBlocks = false;
+      let finalResult = '';
 
-      const chunks = chunkData.map(c => c.text);
-      const cacheIds = chunkData.map(c => c.cacheId);
+      const reader = res.body?.getReader();
+      if (!reader) { setSummaryPhase('all-done'); return; }
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      if (noteIdRef.current !== docId) return;
-      setSectionChunks(chunks);
-      setSectionCacheIds(cacheIds);
-
-      const cachedSummaries: string[] = [];
-      let firstUncachedIdx = -1;
-      for (let i = 0; i < chunkData.length; i++) {
-        if (chunkData[i].cached && chunkData[i].summary) {
-          cachedSummaries.push(chunkData[i].summary!);
-        } else {
-          firstUncachedIdx = i;
-          break;
+      while (true) {
+        if (signal?.aborted) { reader.cancel(); return; }
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data: ') || trimmed === 'data: [DONE]') continue;
+          try {
+            const parsed = JSON.parse(trimmed.slice(6));
+            if (parsed.blocks) {
+              // Long note — backend returned blocks to process in batches
+              blocksRef.current = parsed.blocks;
+              gotBlocks = true;
+            }
+            if (parsed.text) {
+              // Short note — streaming direct summary
+              finalResult = parsed.text;
+              setSummaryPhase('merging');
+              setCurrentStreamText(parsed.text);
+            }
+            if (parsed.progress) setProgressMsg(parsed.progress);
+          } catch {}
         }
       }
 
-      if (firstUncachedIdx === -1) {
-        if (noteIdRef.current !== docId) return;
-        setSectionSummaries(cachedSummaries);
-        setCurrentSectionIdx(chunkData.length - 1);
-        if (chunkData.length === 1) {
-          setMergedSummary(cachedSummaries[0]);
-          setSummaryPhase('merged');
-        } else {
-          setSummaryPhase('all-done');
-        }
-        return;
-      }
+      if (noteIdRef.current !== docId) return;
 
-      if (cachedSummaries.length > 0) {
-        if (noteIdRef.current !== docId) return;
-        setSectionSummaries(cachedSummaries);
+      if (gotBlocks) {
+        // Start first batch of 3
+        await runBatch(0);
+      } else if (finalResult) {
+        setMergedSummary(finalResult);
+        setCurrentStreamText('');
+        setSummaryPhase('merged');
+      } else {
+        setSummaryPhase('all-done');
       }
-
-      await processSection(chunks, firstUncachedIdx, cachedSummaries, cacheIds);
     } catch (err: unknown) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       if (noteIdRef.current !== docId) return;
-      console.error('Summarize error:', err);
-      setSectionSummaries(['Failed to prepare summary. Please refresh.']);
+      setSectionSummaries(['Failed to generate summary. Please try again.']);
       setSummaryPhase('all-done');
     }
-  }, [noteId, hasContent, plainText, processSection]);
+  }, [noteId, hasContent, plainText, runBatch]);
 
-  const loadNextSection = useCallback(() => {
-    const nextIdx = currentSectionIdx + 1;
-    if (nextIdx < sectionChunks.length) {
-      processSection(sectionChunks, nextIdx, sectionSummaries, sectionCacheIds);
-    }
-  }, [currentSectionIdx, sectionChunks, sectionSummaries, sectionCacheIds, processSection]);
+  // Explain pipeline: 100-word chunks, one at a time, Continue between each
+  const explainChunksRef = useRef<string[]>([]);
+  const explainIdxRef = useRef(0);
+  const explainResultsRef = useRef<string[]>([]);
 
-  const runMerge = useCallback(async () => {
-    if (sectionSummaries.length < 2) return;
-
+  const explainOneChunk = useCallback(async (idx: number) => {
     const docId = noteIdRef.current;
     const signal = abortRef.current.signal;
-
-    setSummaryPhase('merging');
-    setCurrentStreamText('');
-    setProgressMsg('Generating full summary...');
-
-    try {
-      const streamRes = await fetch('/api/ai/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'merge-sections',
-          sectionSummaries,
-        }),
-        signal,
-      });
-
-      if (noteIdRef.current !== docId) return;
-
-      let mergeResult = '';
-      if (streamRes.ok) {
-        await readStream(streamRes, (t) => {
-          if (noteIdRef.current !== docId) return;
-          mergeResult = t;
-          setCurrentStreamText(t);
-        }, undefined, undefined, signal);
-      }
-
-      if (noteIdRef.current !== docId) return;
-
-      setMergedSummary(mergeResult);
-      setCurrentStreamText('');
-      setSummaryPhase('merged');
-      setProgressMsg('');
-    } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (noteIdRef.current !== docId) return;
-      console.error('Merge error:', err);
-      setSummaryPhase('all-done');
-      setProgressMsg('');
-    }
-  }, [sectionSummaries]);
-
-  const processExplainSection = useCallback(async (chunks: string[], idx: number, prevSections: SentenceExplanation[][], cacheIds: string[]) => {
-    const docId = noteIdRef.current;
-    const signal = abortRef.current.signal;
-
-    setExplainCurrentIdx(idx);
-    setExplainStreamText('');
     setExplainPhase('streaming');
-    setProgressMsg(`Explaining section ${idx + 1} of ${chunks.length}...`);
+    setExplainStreamText('');
+    setProgressMsg('');
 
     try {
-      const prevContext = prevSections.map((sec, i) =>
-        `Section ${i + 1}: ${sec.map(s => s.explanation).join(' ').slice(0, 300)}`
-      ).join('\n');
-
-      const streamRes = await fetch('/api/ai/stream', {
+      const res = await fetch('/api/ai/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          action: 'explain-section',
-          sectionText: chunks[idx],
-          sectionIndex: idx,
-          totalSections: chunks.length,
-          previousContext: prevContext,
+          action: 'explain-chunk',
+          chunkText: explainChunksRef.current[idx],
+          chunkIndex: idx,
+          totalChunks: explainChunksRef.current.length,
         }),
         signal,
       });
+      if (noteIdRef.current !== docId || !res.ok) return;
+
+      let result = '';
+      await readStream(res,
+        (t) => { if (noteIdRef.current === docId) { result = t; setExplainStreamText(t); } },
+        (msg) => { if (noteIdRef.current === docId) setProgressMsg(msg); },
+        undefined, signal,
+      );
 
       if (noteIdRef.current !== docId) return;
 
-      if (!streamRes.ok) {
-        const errData = await streamRes.json().catch(() => ({}));
-        const errMsg = errData.error || `Error ${streamRes.status}`;
-        if (noteIdRef.current !== docId) return;
-        setExplainSections(prev => [...prev, [{ text: 'Error', explanation: errMsg }]]);
-        setExplainPhase(idx >= chunks.length - 1 ? 'all-done' : 'section-done');
-        setProgressMsg('');
-        return;
-      }
-
-      let sectionResult = '';
-      await readStream(streamRes, (t) => {
-        if (noteIdRef.current !== docId) return;
-        sectionResult = t;
-        setExplainStreamText(t);
-      }, undefined, (err) => {
-        sectionResult = err;
-      }, signal);
-
-      if (noteIdRef.current !== docId) return;
-
-      const parsed = parseExplainFromText(sectionResult, chunks[idx]);
-
-      if (cacheIds[idx]) {
-        saveCacheResult(cacheIds[idx], 'explanation', JSON.stringify(parsed));
-      }
-
-      const newSections = [...prevSections, parsed];
-      setExplainSections(newSections);
+      explainResultsRef.current = [...explainResultsRef.current, result];
+      setExplainSections(explainResultsRef.current.map(text => [{ text: '', explanation: text }]));
+      setExplainCurrentIdx(idx);
       setExplainStreamText('');
       setExplainSource('llm');
       setProgressMsg('');
 
-      if (idx >= chunks.length - 1) {
+      explainIdxRef.current = idx + 1;
+      if (explainIdxRef.current >= explainChunksRef.current.length) {
         setExplainPhase('all-done');
       } else {
         setExplainPhase('section-done');
       }
     } catch (err: unknown) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (noteIdRef.current !== docId) return;
-      console.error('Explain section error:', err);
-      setExplainSections(prev => [...prev, [{ text: 'Error', explanation: 'Failed to explain section.' }]]);
-      setExplainPhase(idx >= chunks.length - 1 ? 'all-done' : 'section-done');
-      setProgressMsg('');
+      setExplainPhase('all-done');
     }
-  }, [saveCacheResult]);
+  }, []);
+
+  const handleExplainContinue = useCallback(() => {
+    explainOneChunk(explainIdxRef.current);
+  }, [explainOneChunk]);
 
   const runExplain = useCallback(async (hardRefresh = false) => {
     if (!noteId || !hasContent) return;
-
     const docId = noteId;
     const signal = abortRef.current.signal;
 
@@ -835,97 +916,70 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
     setExplainSource('');
     setCopiedField(null);
     setProgressMsg('');
+    explainChunksRef.current = [];
+    explainIdxRef.current = 0;
+    explainResultsRef.current = [];
 
     const inputText = plainText.slice(0, 30000);
 
     try {
-      if (hardRefresh) {
-        await fetch('/api/ai/cache', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ action: 'clear', sourceId: noteId }),
-          signal,
-        });
-        if (noteIdRef.current !== docId) return;
-      }
-
-      const prepRes = await fetch('/api/ai/cache', {
+      // Get 100-word chunks from backend
+      const res = await fetch('/api/ai/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'prepare-explain', sourceId: noteId, text: inputText }),
+        body: JSON.stringify({ action: 'explain', text: inputText, sourceId: noteId }),
         signal,
       });
-
-      if (noteIdRef.current !== docId) return;
-
-      const prepData = await prepRes.json();
-
-      if (prepData.error) {
-        if (noteIdRef.current !== docId) return;
-        setExplainSections([[{ text: 'Error', explanation: prepData.error }]]);
+      if (noteIdRef.current !== docId || !res.ok) {
+        setExplainSections([[{ text: '', explanation: 'Failed to start explanation.' }]]);
         setExplainPhase('all-done');
         return;
       }
 
-      const chunkData: { cacheId: string; text: string; explanation: string | null; cached: boolean }[] = prepData.chunks || [];
-      if (chunkData.length === 0) {
-        if (noteIdRef.current !== docId) return;
-        setExplainPhase('idle');
-        return;
-      }
+      // Parse chunks from response
+      const reader = res.body?.getReader();
+      if (!reader) { setExplainPhase('all-done'); return; }
+      const decoder = new TextDecoder();
+      let buffer = '';
 
-      const chunks = chunkData.map(c => c.text);
-      const cacheIds = chunkData.map(c => c.cacheId);
-
-      if (noteIdRef.current !== docId) return;
-      setExplainChunks(chunks);
-      setExplainCacheIds(cacheIds);
-
-      const cachedSections: SentenceExplanation[][] = [];
-      let firstUncachedIdx = -1;
-      for (let i = 0; i < chunkData.length; i++) {
-        if (chunkData[i].cached && chunkData[i].explanation) {
+      while (true) {
+        if (signal?.aborted) { reader.cancel(); return; }
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data: ') || trimmed === 'data: [DONE]') continue;
           try {
-            cachedSections.push(JSON.parse(chunkData[i].explanation!));
-          } catch {
-            cachedSections.push(parseExplainFromText(chunkData[i].explanation!, chunkData[i].text));
-          }
-        } else {
-          firstUncachedIdx = i;
-          break;
+            const parsed = JSON.parse(trimmed.slice(6));
+            if (parsed.explainChunks) {
+              explainChunksRef.current = parsed.explainChunks;
+              setExplainChunks(parsed.explainChunks);
+            }
+          } catch {}
         }
       }
 
-      if (firstUncachedIdx === -1) {
-        if (noteIdRef.current !== docId) return;
-        setExplainSections(cachedSections);
-        setExplainCurrentIdx(chunkData.length - 1);
-        setExplainSource('llm');
+      if (noteIdRef.current !== docId) return;
+
+      if (explainChunksRef.current.length > 0) {
+        await explainOneChunk(0);
+      } else {
         setExplainPhase('all-done');
-        return;
       }
-
-      if (cachedSections.length > 0) {
-        if (noteIdRef.current !== docId) return;
-        setExplainSections(cachedSections);
-      }
-
-      await processExplainSection(chunks, firstUncachedIdx, cachedSections, cacheIds);
     } catch (err: unknown) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
       if (noteIdRef.current !== docId) return;
-      console.error('Explain error:', err);
-      setExplainSections([[{ text: 'Error', explanation: 'Failed to prepare explanation. Please refresh.' }]]);
+      setExplainSections([[{ text: '', explanation: 'Failed to prepare explanation.' }]]);
       setExplainPhase('all-done');
     }
-  }, [noteId, hasContent, plainText, processExplainSection]);
+  }, [noteId, hasContent, plainText, explainOneChunk]);
 
   const loadNextExplainSection = useCallback(() => {
-    const nextIdx = explainCurrentIdx + 1;
-    if (nextIdx < explainChunks.length) {
-      processExplainSection(explainChunks, nextIdx, explainSections, explainCacheIds);
-    }
-  }, [explainCurrentIdx, explainChunks, explainSections, explainCacheIds, processExplainSection]);
+    handleExplainContinue();
+  }, [handleExplainContinue]);
 
   const isGreeting = useCallback((msg: string): boolean => {
     const trimmed = msg.trim().toLowerCase();
@@ -1423,54 +1477,89 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                     )}
                   </div>
 
-                  {(summaryPhase === 'preparing' || (summaryPhase === 'streaming' && !currentStreamText) || (summaryPhase === 'merging' && !currentStreamText)) && (
-                    <TypingIndicator />
+                  {/* Skeleton — waiting for first block */}
+                  {(summaryPhase === 'preparing' || (summaryPhase === 'streaming' && sectionSummaries.length === 0 && !currentStreamText)) && (
+                    <SkeletonBlock lines={3} message={progressMsg || undefined} />
                   )}
 
-                  {((summaryPhase === 'streaming' && currentStreamText) || (summaryPhase === 'merging' && currentStreamText)) && (
-                    <div className="rounded-lg bg-muted/40 p-3">
-                      <p className="text-[12px] text-foreground/85 leading-relaxed whitespace-pre-wrap">
+                  {/* Block summaries (long notes) + currently streaming block */}
+                  {(sectionSummaries.length > 0 || (summaryPhase === 'streaming' && currentStreamText)) && summaryPhase !== 'merged' && summaryPhase !== 'merging' && (
+                    <div className="space-y-1.5">
+                      {sectionSummaries.map((section, i) => (
+                        <div key={i} className="rounded-md border border-border/60 overflow-hidden">
+                          <div className="flex items-center gap-1.5 px-3 py-1 bg-muted/30 border-b border-border/40">
+                            <div className="w-1 h-1 rounded-full bg-primary/50" />
+                            <span className="text-[9px] font-medium text-muted-foreground/70 uppercase tracking-widest">Section {i + 1}</span>
+                          </div>
+                          <div className="px-3 py-2">
+                            <p className="text-[12px] text-foreground/80 leading-relaxed">{section}</p>
+                          </div>
+                        </div>
+                      ))}
+
+                      {/* Currently streaming block — typing animation */}
+                      {summaryPhase === 'streaming' && currentStreamText && (
+                        <div className="rounded-md border border-border/60 overflow-hidden">
+                          <div className="flex items-center gap-1.5 px-3 py-1 bg-muted/30 border-b border-border/40">
+                            <div className="w-1 h-1 rounded-full bg-primary/50" />
+                            <span className="text-[9px] font-medium text-muted-foreground/70 uppercase tracking-widest">Section {currentSectionIdx + 1}</span>
+                          </div>
+                          <div className="px-3 py-2">
+                            <p className="text-[12px] text-foreground/80 leading-relaxed">
+                              {currentStreamText}
+                              <span className="inline-block w-[2px] h-3.5 bg-primary/60 animate-pulse ml-0.5 align-middle rounded-full" />
+                            </p>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Skeleton between blocks — waiting for next block to start */}
+                      {summaryPhase === 'streaming' && !currentStreamText && progressMsg && (
+                        <SkeletonBlock lines={2} message={progressMsg} />
+                      )}
+
+                      {/* Continue button */}
+                      {summaryPhase === 'section-done' && (
+                        <button
+                          onClick={handleContinue}
+                          className="w-full flex items-center justify-center py-2.5 rounded-md text-[11px] font-medium text-muted-foreground hover:text-foreground bg-muted/20 hover:bg-muted/40 border border-border/40 transition-all duration-200"
+                        >
+                          Continue
+                        </button>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Final summary / short note streaming with typing cursor */}
+                  {summaryPhase === 'merging' && currentStreamText && (
+                    <div className="rounded-md bg-muted/20 p-3 border border-border/30">
+                      <p className="text-[12px] text-foreground/85 leading-[1.7] whitespace-pre-wrap">
                         {currentStreamText}
-                        <span className="inline-block w-1.5 h-4 bg-primary/60 animate-pulse ml-0.5 align-middle" />
+                        <span className="inline-block w-[2px] h-3.5 bg-primary/60 animate-pulse ml-0.5 align-middle rounded-full" />
                       </p>
                     </div>
                   )}
 
-                  {(summaryPhase === 'merged' || (summaryPhase === 'all-done' && sectionSummaries.length === 1)) && (mergedSummary || sectionSummaries.length > 0) && (
+                  {/* Skeleton before final summary */}
+                  {summaryPhase === 'merging' && !currentStreamText && (
+                    <SkeletonBlock lines={3} message="Writing final summary..." />
+                  )}
+
+                  {/* Completed */}
+                  {summaryPhase === 'merged' && mergedSummary && (
                     <StructuredSummaryView
-                      text={mergedSummary || sectionSummaries[0]}
+                      text={mergedSummary}
                       showAllPoints={showAllPoints}
                       onToggleShowAll={(key) => setShowAllPoints(prev => ({ ...prev, [key]: !prev[key] }))}
                     />
                   )}
 
-                  {(summaryPhase === 'section-done' || (summaryPhase === 'all-done' && sectionSummaries.length > 1)) && (
-                    <div className="space-y-3">
-                      {sectionSummaries.map((section, i) => (
-                        <div key={i} className="rounded-lg border border-border overflow-hidden">
-                          <div className="bg-primary/5 border-b border-border px-3 py-1.5">
-                            <span className="text-[10px] font-medium text-muted-foreground">Section {i + 1}</span>
-                          </div>
-                          <div className="px-3 py-2">
-                            <StructuredSummaryView
-                              text={section}
-                              showAllPoints={showAllPoints}
-                              onToggleShowAll={(key) => setShowAllPoints(prev => ({ ...prev, [key]: !prev[key] }))}
-                            />
-                          </div>
-                        </div>
-                      ))}
-
-                      {summaryPhase === 'section-done' && currentSectionIdx < sectionChunks.length - 1 && (
-                        <button
-                          onClick={loadNextSection}
-                          className="w-full flex items-center justify-center gap-2 py-2 rounded-lg border border-dashed border-primary/30 text-[11px] font-medium text-primary hover:bg-primary/5 transition-colors"
-                        >
-                          Continue
-                        </button>
-                      )}
-
-                    </div>
+                  {summaryPhase === 'all-done' && sectionSummaries.length > 0 && !mergedSummary && (
+                    <StructuredSummaryView
+                      text={sectionSummaries.join('\n\n')}
+                      showAllPoints={showAllPoints}
+                      onToggleShowAll={(key) => setShowAllPoints(prev => ({ ...prev, [key]: !prev[key] }))}
+                    />
                   )}
                 </div>
               )}
@@ -1518,44 +1607,66 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                     )}
                   </div>
 
-                  {(explainPhase === 'preparing' || (explainPhase === 'streaming' && !explainStreamText)) && (
-                    <TypingIndicator />
+                  {/* Skeleton while waiting */}
+                  {(explainPhase === 'preparing' || (explainPhase === 'streaming' && explainSections.length === 0 && !explainStreamText)) && (
+                    <SkeletonBlock lines={3} message={progressMsg || undefined} />
                   )}
 
-                  {explainPhase === 'streaming' && explainStreamText && (
-                    <div className="rounded-lg bg-muted/40 p-3">
-                      <p className="text-[12px] text-foreground/80 leading-relaxed whitespace-pre-wrap">
-                        {explainStreamText}
-                        <span className="inline-block w-1.5 h-4 bg-primary/60 animate-pulse ml-0.5 align-middle" />
-                      </p>
-                    </div>
-                  )}
-
-                  {(explainPhase === 'section-done' || explainPhase === 'all-done') && explainSections.length > 0 && (
-                    <div className="space-y-3">
-                      {explainSections.flat().map((item, i) => (
-                        <div key={i} className="rounded-lg border border-border overflow-hidden">
-                          <div className="bg-primary/5 border-b border-border px-3 py-2">
-                            <p className="text-[12px] text-foreground font-medium leading-relaxed">
-                              {item.text}
-                            </p>
+                  {/* Completed explanation sections */}
+                  {explainSections.length > 0 && (
+                    <div className="space-y-1.5">
+                      {explainSections.flat().filter(item => item.explanation).map((item, i) => (
+                        <div key={i} className="rounded-md border border-border/60 overflow-hidden">
+                          <div className="flex items-center gap-1.5 px-3 py-1 bg-muted/30 border-b border-border/40">
+                            <div className="w-1 h-1 rounded-full bg-primary/50" />
+                            <span className="text-[9px] font-medium text-muted-foreground/70 uppercase tracking-widest">Section {i + 1}</span>
                           </div>
                           <div className="px-3 py-2">
-                            <p className="text-[12px] text-muted-foreground leading-relaxed">
-                              {item.explanation}
-                            </p>
+                            <p className="text-[12px] text-foreground/80 leading-relaxed">{item.explanation}</p>
                           </div>
                         </div>
                       ))}
 
-                      {explainPhase === 'section-done' && explainCurrentIdx < explainChunks.length - 1 && (
+                      {/* Currently streaming explanation with typing cursor */}
+                      {explainPhase === 'streaming' && explainStreamText && (
+                        <div className="rounded-md border border-border/60 overflow-hidden">
+                          <div className="flex items-center gap-1.5 px-3 py-1 bg-muted/30 border-b border-border/40">
+                            <div className="w-1 h-1 rounded-full bg-primary/50" />
+                            <span className="text-[9px] font-medium text-muted-foreground/70 uppercase tracking-widest">Section {explainCurrentIdx + 1}</span>
+                          </div>
+                          <div className="px-3 py-2">
+                            <p className="text-[12px] text-foreground/80 leading-relaxed">
+                              {explainStreamText}
+                              <span className="inline-block w-[2px] h-3.5 bg-primary/60 animate-pulse ml-0.5 align-middle rounded-full" />
+                            </p>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Skeleton between sections */}
+                      {explainPhase === 'streaming' && !explainStreamText && progressMsg && (
+                        <SkeletonBlock lines={2} message={progressMsg} />
+                      )}
+
+                      {/* Continue button */}
+                      {explainPhase === 'section-done' && (
                         <button
-                          onClick={loadNextExplainSection}
-                          className="w-full flex items-center justify-center gap-2 py-2 rounded-lg border border-dashed border-primary/30 text-[11px] font-medium text-primary hover:bg-primary/5 transition-colors"
+                          onClick={handleExplainContinue}
+                          className="w-full flex items-center justify-center py-2.5 rounded-md text-[11px] font-medium text-muted-foreground hover:text-foreground bg-muted/20 hover:bg-muted/40 border border-border/40 transition-all duration-200"
                         >
                           Continue
                         </button>
                       )}
+                    </div>
+                  )}
+
+                  {/* Short note: streaming directly */}
+                  {explainSections.length === 0 && explainPhase === 'streaming' && explainStreamText && (
+                    <div className="rounded-md bg-muted/20 p-3 border border-border/30">
+                      <p className="text-[12px] text-foreground/85 leading-[1.7] whitespace-pre-wrap">
+                        {explainStreamText}
+                        <span className="inline-block w-[2px] h-3.5 bg-primary/60 animate-pulse ml-0.5 align-middle rounded-full" />
+                      </p>
                     </div>
                   )}
                 </div>

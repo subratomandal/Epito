@@ -21,9 +21,10 @@
         "fullscreen": false,
         "center": true,
         "decorations": true,
+        "titleBarStyle": "Transparent",
+        "hiddenTitle": true,
         "visible": false,
-        "url": "about:blank",
-        "backgroundColor": "#0a0a0f"
+        "url": "about:blank"
       }
     ],
     "security": {

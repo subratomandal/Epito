@@ -32,18 +32,15 @@ export async function initEmbeddings(): Promise<void> {
 export async function generateEmbedding(text: string): Promise<number[]> {
   await initEmbeddings();
 
+  // all-MiniLM-L6-v2 supports 256 word-pieces (~1500 chars effective).
+  // Truncating at 2000 chars is safe; increasing wastes compute with no benefit.
+  // For chunks >2000 chars, we embed the first 2000 — tail content gets
+  // covered by the 25% overlap in the chunking strategy.
   const truncated = text.slice(0, 2000);
-
-  // 30-second timeout per embedding to prevent infinite hangs
-  const result = await Promise.race([
-    (embedder as (text: string, opts: Record<string, unknown>) => Promise<{ data: Float32Array }>)(
-      truncated,
-      { pooling: 'mean', normalize: true }
-    ),
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('Embedding generation timed out (30s)')), 30000)
-    ),
-  ]);
+  const result = await (embedder as (text: string, opts: Record<string, unknown>) => Promise<{ data: Float32Array }>)(
+    truncated,
+    { pooling: 'mean', normalize: true }
+  );
 
   return Array.from(result.data);
 }

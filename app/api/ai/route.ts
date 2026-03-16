@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { summarize, retrieveChunksForSummarization, contextualRetrieveForChat } from '@/lib/ai/pipeline';
+import { summarize, retrieveChunksForSummarization } from '@/lib/ai/pipeline';
 import {
   summarizeText, summarizeChunks, explainText,
-  chatWithRAG, classifyQuery, getGreetingResponse,
+  msrChat,
   getModelStatus, cleanInputText, chunkForSummarization, chunkForExplain,
 } from '@/lib/ai/llm';
 import { canAcceptTask, taskStarted, taskCompleted, isShuttingDown } from '@/lib/lifecycle';
@@ -101,30 +101,9 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ error: 'chatMessage required' }, { status: 400 });
         }
 
-        const queryType = classifyQuery(chatMessage);
-
-        if (queryType === 'greeting' || queryType === 'casual') {
-          return NextResponse.json({ response: getGreetingResponse(), source: 'classification' });
-        }
-
-        const retrieval = await contextualRetrieveForChat(sourceId || null, chatMessage, 5);
-
-        if (retrieval.contexts.length > 0) {
-          const response = await chatWithRAG(retrieval.contexts, chatMessage, chatHistory || []);
-          return NextResponse.json({
-            response,
-            source: 'rag',
-            retrieval: {
-              method: retrieval.method,
-              sources: retrieval.sources,
-            },
-          });
-        }
-
-        return NextResponse.json({
-          response: 'No relevant content found in the document to answer your question. Try rephrasing or ensure the document has been processed.',
-          source: 'none',
-        });
+        // MSR-RAG: Multi-Stage Reasoning Retrieval pipeline
+        const response = await msrChat(sourceId || null, chatMessage, chatHistory || []);
+        return NextResponse.json({ response, source: 'msr-rag' });
       }
 
       case 'prepare-summary': {

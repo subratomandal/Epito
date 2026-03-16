@@ -1,13 +1,14 @@
 import { NextRequest } from 'next/server';
 import {
-  summarizeTextStream, summarizeChunksStream,
-  explainTextStream,
-  chatWithRAGStream, classifyQuery, getGreetingResponse,
-  summarizeSectionStream, mergeSectionsStream,
-  explainSectionStream,
+  splitNoteIntoBlocks,
+  summarizeBatchStream,
+  synthesizeFinalStream,
+  directSummarizeStream,
+  msrChatStream,
   cleanInputText,
 } from '@/lib/ai/llm';
-import { retrieveChunksForSummarization, contextualRetrieveForChat } from '@/lib/ai/pipeline';
+import type { SummaryEvent } from '@/lib/ai/llm';
+import { splitInto100WordChunks, explainSingleChunk } from '@/lib/ai/explain';
 import { canAcceptTask, taskStarted, taskCompleted, isShuttingDown } from '@/lib/lifecycle';
 
 export const dynamic = 'force-dynamic';
@@ -35,9 +36,10 @@ export async function POST(request: NextRequest) {
       headers: { 'Content-Type': 'application/json' },
     });
   }
-  const { action, text, sourceId, chatMessage, chatHistory, sectionText, sectionIndex, totalSections, previousPoints, previousContext, sectionSummaries } = body;
+  const { action, text, sourceId, chatMessage, chatHistory, sectionText, sectionIndex, totalSections, previousPoints, previousContext, sectionSummaries,
+    blocks, startIdx, batchSize, previousBlockSummaries, allBlockSummaries } = body;
 
-  if (!text?.trim() && action !== 'summarize-section' && action !== 'merge-sections' && action !== 'explain-section') {
+  if (!text?.trim() && action !== 'explain-section' && action !== 'explain-chunk' && action !== 'summarize-batch' && action !== 'summarize-final') {
     return new Response(JSON.stringify({ error: 'Text required' }), {
       status: 400,
       headers: { 'Content-Type': 'application/json' },
@@ -52,23 +54,77 @@ export async function POST(request: NextRequest) {
     async start(controller) {
       try {
         if (action === 'summarize') {
-          controller.enqueue(encoder.encode(`data: ${JSON.stringify({ progress: 'Retrieving relevant content...' })}\n\n`));
-          const chunks = await retrieveChunksForSummarization(sourceId || null, cleaned, 10);
-
-          if (chunks.length > 0) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ progress: 'Analyzing content and extracting insights...' })}\n\n`));
-
-            for await (const chunk of summarizeChunksStream(chunks)) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
+          // Short notes: direct single-call summarization
+          // Long notes: frontend splits into blocks and calls summarize-batch
+          const wc = cleaned.split(/\s+/).length;
+          if (wc <= 800) {
+            for await (const event of directSummarizeStream(cleaned)) {
+              if (event.type === 'progress') {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ progress: event.message })}\n\n`));
+              } else if (event.type === 'final') {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: event.text })}\n\n`));
+              }
             }
           } else {
-            for await (const chunk of summarizeTextStream(cleaned)) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
+            // Long note: return blocks for the frontend to drive batching
+            const noteBlocks = splitNoteIntoBlocks(cleaned);
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ blocks: noteBlocks })}\n\n`));
+          }
+        } else if (action === 'summarize-batch') {
+          // Process exactly one batch of blocks (3 at a time). Then stop.
+          // Frontend calls this again with the next startIdx after user clicks Continue.
+          const gen = summarizeBatchStream(
+            blocks || [],
+            startIdx || 0,
+            batchSize || 3,
+            previousBlockSummaries || [],
+          );
+          for await (const event of gen) {
+            if (event.type === 'progress') {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ progress: event.message })}\n\n`));
+            } else if (event.type === 'blockStream') {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                blockStream: event.text,
+                blockIndex: event.index,
+                totalBlocks: event.total,
+              })}\n\n`));
+            } else if (event.type === 'blockDone') {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                blockDone: event.summary,
+                blockIndex: event.index,
+                totalBlocks: event.total,
+              })}\n\n`));
+            }
+          }
+        } else if (action === 'summarize-final') {
+          // Generate the final merged summary from all block summaries
+          for await (const event of synthesizeFinalStream(allBlockSummaries || [])) {
+            if (event.type === 'progress') {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ progress: event.message })}\n\n`));
+            } else if (event.type === 'final') {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: event.text })}\n\n`));
             }
           }
         } else if (action === 'explain') {
-          for await (const chunk of explainTextStream(cleaned)) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
+          // Split into 100-word chunks and return to frontend
+          const chunks = splitInto100WordChunks(cleaned);
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+            explainChunks: chunks.map(c => c.text),
+          })}\n\n`));
+        } else if (action === 'explain-chunk') {
+          // Explain exactly ONE 100-word chunk, then stop.
+          const chunkText = body.chunkText || '';
+          const chunkIndex = body.chunkIndex || 0;
+          const totalChunks = body.totalChunks || 1;
+
+          for await (const event of explainSingleChunk(chunkText, chunkIndex, totalChunks)) {
+            if (event.type === 'progress') {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ progress: event.message })}\n\n`));
+            } else if (event.type === 'segmentStream') {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: event.text })}\n\n`));
+            } else if (event.type === 'segmentDone') {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ explainDone: event.explanation })}\n\n`));
+            }
           }
         } else if (action === 'chat') {
           if (!chatMessage) {
@@ -77,73 +133,8 @@ export async function POST(request: NextRequest) {
             return;
           }
 
-          const queryType = classifyQuery(chatMessage);
-
-          if (queryType === 'greeting' || queryType === 'casual') {
-            const greeting = getGreetingResponse();
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: greeting })}\n\n`));
-          } else {
-            const retrieval = await contextualRetrieveForChat(sourceId || null, chatMessage, 5);
-
-            if (retrieval.contexts.length > 0) {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                progress: retrieval.method === 'contextual'
-                  ? `Found ${retrieval.sources.length} relevant section${retrieval.sources.length > 1 ? 's' : ''} in document...`
-                  : 'Searching document...',
-              })}\n\n`));
-
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                retrieval: {
-                  method: retrieval.method,
-                  sources: retrieval.sources,
-                },
-              })}\n\n`));
-
-              for await (const chunk of chatWithRAGStream(retrieval.contexts, chatMessage, chatHistory || [])) {
-                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
-              }
-            } else {
-              controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: 'No relevant content found in the document to answer your question. Try rephrasing or ensure the document has been processed.' })}\n\n`));
-            }
-          }
-        } else if (action === 'summarize-section') {
-          if (!sectionText) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: 'sectionText required' })}\n\n`));
-            controller.close();
-            return;
-          }
-          for await (const chunk of summarizeSectionStream(sectionText, sectionIndex || 0, totalSections || 1, previousPoints || '')) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
-          }
-        } else if (action === 'explain-section') {
-          if (!sectionText) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: 'sectionText required' })}\n\n`));
-            controller.close();
-            return;
-          }
-
-          let surroundingContext = '';
-          if (cleaned) {
-            const words = cleaned.split(/\s+/).filter((w: string) => w.length > 0);
-            const sectionWordCount = 100;
-            const sectionStartWord = (sectionIndex || 0) * sectionWordCount;
-            const ctxStart = Math.max(0, sectionStartWord - 150);
-            const ctxEnd = Math.min(words.length, sectionStartWord + sectionWordCount + 150);
-            const before = words.slice(ctxStart, sectionStartWord).join(' ');
-            const after = words.slice(Math.min(words.length, sectionStartWord + sectionWordCount), ctxEnd).join(' ');
-            surroundingContext = [before, after].filter(Boolean).join(' ... ');
-          }
-
-          for await (const chunk of explainSectionStream(sectionText, sectionIndex || 0, totalSections || 1, previousContext || '', surroundingContext)) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
-          }
-        } else if (action === 'merge-sections') {
-          if (!sectionSummaries?.length) {
-            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: 'sectionSummaries required' })}\n\n`));
-            controller.close();
-            return;
-          }
-          for await (const chunk of mergeSectionsStream(sectionSummaries)) {
+          // MSR-RAG: Multi-Stage Reasoning Retrieval pipeline
+          for await (const chunk of msrChatStream(sourceId || null, chatMessage, chatHistory || [])) {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
           }
         }

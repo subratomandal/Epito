@@ -26,7 +26,7 @@ export async function initPipeline(): Promise<void> {
 
 const CHUNK_MIN_WORDS = 300;
 const CHUNK_MAX_WORDS = 500;
-const CHUNK_OVERLAP_WORDS = 75;
+const CHUNK_OVERLAP_WORDS = 125; // 25% overlap (was 75/15%)
 
 function countWords(text: string): number {
   return text.split(/\s+/).filter(w => w.length > 0).length;
@@ -37,65 +37,258 @@ function splitSentences(text: string): string[] {
   return raw.map(s => s.trim()).filter(s => s.length > 0);
 }
 
-function chunkText(text: string): { content: string; startOffset: number; endOffset: number }[] {
-  const cleaned = cleanInputText(text);
-  const sentences = splitSentences(cleaned);
+// ─── P24: Frontmatter Stripping ──────────────────────────────────────────────
+// Markdown frontmatter (---\nyaml\n---) causes parse errors. Strip before chunking.
 
-  if (sentences.length === 0) {
-    return cleaned.length > 0
-      ? [{ content: cleaned, startOffset: 0, endOffset: cleaned.length }]
-      : [];
+function stripFrontmatter(text: string): string {
+  return text.replace(/^---\s*\n[\s\S]*?\n---\s*\n/, '').trim();
+}
+
+// ─── Structure-Aware Pre-Processing ──────────────────────────────────────────
+// Extracts code blocks, tables, and lists BEFORE sentence splitting.
+// These are preserved as single chunks and never split mid-structure.
+
+interface StructuredBlock {
+  type: 'prose' | 'code' | 'table';
+  content: string;
+  startOffset: number;
+}
+
+function extractStructuredBlocks(text: string): StructuredBlock[] {
+  const blocks: StructuredBlock[] = [];
+  let remaining = text;
+  let offset = 0;
+
+  // Regex for fenced code blocks (```...```)
+  const codeBlockRe = /```[\s\S]*?```/g;
+  // Regex for markdown tables (lines with |)
+  const tableRe = /(?:^|\n)(\|.+\|(?:\n\|[-:| ]+\|)?(?:\n\|.+\|)+)/gm;
+
+  // Collect all structured regions
+  const regions: { start: number; end: number; type: 'code' | 'table'; content: string }[] = [];
+
+  let m;
+  while ((m = codeBlockRe.exec(text)) !== null) {
+    regions.push({ start: m.index, end: m.index + m[0].length, type: 'code', content: m[0] });
+  }
+  while ((m = tableRe.exec(text)) !== null) {
+    const s = m.index + (m[0].startsWith('\n') ? 1 : 0);
+    regions.push({ start: s, end: m.index + m[0].length, type: 'table', content: m[0].trim() });
   }
 
-  const chunks: { content: string; startOffset: number; endOffset: number }[] = [];
-  let currentSentences: string[] = [];
-  let currentWords = 0;
-  let offset = 0;
-  let chunkStart = 0;
+  // Sort by position, no overlaps
+  regions.sort((a, b) => a.start - b.start);
+  const merged: typeof regions = [];
+  for (const r of regions) {
+    if (merged.length > 0 && r.start < merged[merged.length - 1].end) continue;
+    merged.push(r);
+  }
 
-  for (let si = 0; si < sentences.length; si++) {
-    const sentence = sentences[si];
-    const sentenceWords = countWords(sentence);
+  // Split text into prose and structured blocks
+  let cursor = 0;
+  for (const region of merged) {
+    if (region.start > cursor) {
+      const prose = text.slice(cursor, region.start).trim();
+      if (prose) blocks.push({ type: 'prose', content: prose, startOffset: cursor });
+    }
+    blocks.push({ type: region.type, content: region.content, startOffset: region.start });
+    cursor = region.end;
+  }
+  if (cursor < text.length) {
+    const prose = text.slice(cursor).trim();
+    if (prose) blocks.push({ type: 'prose', content: prose, startOffset: cursor });
+  }
 
-    if (currentWords + sentenceWords > CHUNK_MAX_WORDS && currentWords >= CHUNK_MIN_WORDS) {
-      const content = currentSentences.join(' ');
-      chunks.push({ content, startOffset: chunkStart, endOffset: offset });
+  return blocks.length > 0 ? blocks : [{ type: 'prose', content: text, startOffset: 0 }];
+}
 
-      let overlapWords = 0;
-      let overlapStart = currentSentences.length;
-      for (let j = currentSentences.length - 1; j >= 0; j--) {
-        const w = countWords(currentSentences[j]);
-        if (overlapWords + w > CHUNK_OVERLAP_WORDS) break;
-        overlapWords += w;
-        overlapStart = j;
+function chunkText(text: string): { content: string; startOffset: number; endOffset: number }[] {
+  const cleaned = cleanInputText(stripFrontmatter(text));
+  if (!cleaned.trim()) return [];
+
+  const blocks = extractStructuredBlocks(cleaned);
+  const allChunks: { content: string; startOffset: number; endOffset: number }[] = [];
+
+  for (const block of blocks) {
+    if (block.type === 'code' || block.type === 'table') {
+      // Structured blocks are NEVER split — kept as single chunks
+      allChunks.push({
+        content: block.content,
+        startOffset: block.startOffset,
+        endOffset: block.startOffset + block.content.length,
+      });
+      continue;
+    }
+
+    // ── Paragraph-Aware Chunking ──────────────────────────────────────
+    // Split on paragraph boundaries FIRST to preserve entity relationships.
+    // Then merge small paragraphs and split oversized ones by sentence.
+    // This prevents entity relation collapse across chunk boundaries.
+    const paragraphs = block.content.split(/\n\s*\n/).filter(p => p.trim().length > 0);
+
+    let currentParagraphs: string[] = [];
+    let currentWords = 0;
+    let offset = block.startOffset;
+    let chunkStart = block.startOffset;
+
+    for (const paragraph of paragraphs) {
+      const paraWords = countWords(paragraph);
+
+      // If this single paragraph exceeds max, split it by sentences
+      if (paraWords > CHUNK_MAX_WORDS) {
+        // Flush current buffer first
+        if (currentParagraphs.length > 0) {
+          const content = currentParagraphs.join('\n\n');
+          allChunks.push({ content, startOffset: chunkStart, endOffset: offset });
+          currentParagraphs = [];
+          currentWords = 0;
+          chunkStart = offset;
+        }
+
+        // Split large paragraph by sentences with overlap
+        const sentences = splitSentences(paragraph);
+        let sentBuf: string[] = [];
+        let sentWords = 0;
+        let sentStart = offset;
+
+        for (const sentence of sentences) {
+          const sw = countWords(sentence);
+          if (sentWords + sw > CHUNK_MAX_WORDS && sentWords >= CHUNK_MIN_WORDS) {
+            allChunks.push({
+              content: sentBuf.join(' '),
+              startOffset: sentStart,
+              endOffset: offset,
+            });
+            // Overlap: keep last ~25% of sentences
+            let overlapWords = 0;
+            let overlapIdx = sentBuf.length;
+            for (let j = sentBuf.length - 1; j >= 0; j--) {
+              const w = countWords(sentBuf[j]);
+              if (overlapWords + w > CHUNK_OVERLAP_WORDS) break;
+              overlapWords += w;
+              overlapIdx = j;
+            }
+            sentBuf = sentBuf.slice(overlapIdx);
+            sentWords = overlapWords;
+            sentStart = Math.max(block.startOffset, offset - sentBuf.join(' ').length);
+          }
+          sentBuf.push(sentence);
+          sentWords += sw;
+          offset += sentence.length + 1;
+        }
+        if (sentBuf.length > 0) {
+          allChunks.push({ content: sentBuf.join(' '), startOffset: sentStart, endOffset: offset });
+        }
+        chunkStart = offset;
+        continue;
       }
 
-      const overlapSentences = currentSentences.slice(overlapStart);
-      currentSentences = [...overlapSentences];
-      currentWords = overlapWords;
-      chunkStart = offset - overlapSentences.join(' ').length;
+      // Would adding this paragraph exceed the limit?
+      if (currentWords + paraWords > CHUNK_MAX_WORDS && currentWords >= CHUNK_MIN_WORDS) {
+        const content = currentParagraphs.join('\n\n');
+        allChunks.push({ content, startOffset: chunkStart, endOffset: offset });
+
+        // Overlap: keep last paragraph if small enough
+        const lastPara = currentParagraphs[currentParagraphs.length - 1];
+        const lastWords = countWords(lastPara || '');
+        if (lastWords <= CHUNK_OVERLAP_WORDS && currentParagraphs.length > 1) {
+          currentParagraphs = [lastPara];
+          currentWords = lastWords;
+          chunkStart = Math.max(block.startOffset, offset - lastPara.length);
+        } else {
+          currentParagraphs = [];
+          currentWords = 0;
+          chunkStart = offset;
+        }
+      }
+
+      currentParagraphs.push(paragraph);
+      currentWords += paraWords;
+      offset += paragraph.length + 2; // +2 for \n\n
     }
 
-    currentSentences.push(sentence);
-    currentWords += sentenceWords;
-    offset += sentence.length + 1;
-  }
-
-  if (currentSentences.length > 0) {
-    const content = currentSentences.join(' ');
-    if (currentWords < CHUNK_MIN_WORDS / 2 && chunks.length > 0) {
-      const lastChunk = chunks[chunks.length - 1];
-      chunks[chunks.length - 1] = {
-        content: lastChunk.content + ' ' + content,
-        startOffset: lastChunk.startOffset,
-        endOffset: offset,
-      };
-    } else {
-      chunks.push({ content, startOffset: chunkStart, endOffset: offset });
+    // Flush remaining
+    if (currentParagraphs.length > 0) {
+      const content = currentParagraphs.join('\n\n');
+      if (currentWords < CHUNK_MIN_WORDS / 2 && allChunks.length > 0) {
+        const last = allChunks[allChunks.length - 1];
+        allChunks[allChunks.length - 1] = {
+          content: last.content + '\n\n' + content,
+          startOffset: last.startOffset,
+          endOffset: offset,
+        };
+      } else {
+        allChunks.push({ content, startOffset: chunkStart, endOffset: offset });
+      }
     }
   }
 
-  return chunks.length > 0 ? chunks : [{ content: cleaned, startOffset: 0, endOffset: cleaned.length }];
+  return allChunks.length > 0 ? allChunks : [{ content: cleaned, startOffset: 0, endOffset: cleaned.length }];
+}
+
+// ─── Entity Extraction (runs during ingestion, stored in DB) ─────────────────
+
+const ENTITY_EXTRACTORS: { type: string; patterns: RegExp[] }[] = [
+  {
+    type: 'ORG',
+    patterns: [
+      /(?:General\s+(?:Sir\s+)?)?[A-Z][a-z]+(?:\s+(?:[A-Z][a-z]+|of|the|and|for|in|Sir|General))*\s+(?:University|Institute|College|Academy|School)/g,
+      /University\s+of\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*/g,
+      /[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*(?:\s+(?:Inc|Corp|Ltd|LLC|Co|Group|Foundation|Technologies|Labs|Systems)\.?)/g,
+    ],
+  },
+  {
+    type: 'PERSON',
+    patterns: [
+      /[A-Z][a-z]{1,15}\s+(?:[A-Z]\.?\s+)?[A-Z][a-z]{1,15}(?:\s+[A-Z][a-z]{1,15})?/g,
+    ],
+  },
+  {
+    type: 'TOOL',
+    patterns: [
+      /\b(?:BeautifulSoup|Scrapy|Selenium|lxml|Flask|Django|MongoDB|PostgreSQL|MySQL|Redis|TensorFlow|PyTorch|Keras|NumPy|Pandas|Scikit-learn|OpenCV|Docker|Kubernetes|React|Angular|Vue|Next\.js|Node\.js)\b/g,
+    ],
+  },
+];
+
+function extractAndStoreEntities(
+  documentId: string,
+  chunks: { content: string; startOffset: number; endOffset: number }[],
+  chunkIds: string[],
+): void {
+  const seen = new Set<string>();
+
+  for (let i = 0; i < chunks.length; i++) {
+    const text = chunks[i].content;
+    const chunkId = chunkIds[i];
+
+    for (const { type, patterns } of ENTITY_EXTRACTORS) {
+      for (const pattern of patterns) {
+        pattern.lastIndex = 0;
+        let m;
+        while ((m = pattern.exec(text)) !== null) {
+          let name = m[0].trim();
+          if (name.length < 3) continue;
+
+          // Normalize common abbreviations
+          if (name === 'MIT') name = 'Massachusetts Institute of Technology';
+
+          const key = `${type}:${name.toLowerCase()}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+
+          // Extract evidence sentence
+          const sentStart = Math.max(0, text.lastIndexOf('.', m.index) + 1);
+          const sentEnd = text.indexOf('.', m.index + m[0].length);
+          const evidence = text.slice(sentStart, sentEnd > 0 ? sentEnd + 1 : m.index + m[0].length + 80).trim().slice(0, 200);
+
+          db.insertEntity(documentId, name, type, chunkId, evidence);
+        }
+      }
+    }
+  }
+
+  console.log(`[AI] Entity index: ${seen.size} entities extracted for document ${documentId}`);
 }
 
 export async function processNote(noteId: string): Promise<void> {
@@ -126,6 +319,10 @@ export async function processNote(noteId: string): Promise<void> {
   const noteText = `${note.title}. ${plainText.slice(0, 1000)}`;
   const noteEmb = await generateEmbedding(noteText);
   db.insertNoteEmbedding(noteId, noteEmb);
+
+  // Build entity index — extract organizations, people, tools from all chunks
+  db.deleteEntitiesByDocument(noteId);
+  extractAndStoreEntities(noteId, chunks, chunkIds);
   noteIndex.add(noteId, noteEmb);
 
   scheduleRebuildTopicsAndLinks();
@@ -155,33 +352,19 @@ export async function processDocument(docId: string): Promise<void> {
     }
     db.updateDocument(docId, { chunk_count: chunkIds.length });
 
-    let embeddedCount = 0;
     for (let i = 0; i < chunkIds.length; i++) {
-      try {
-        const emb = await generateEmbedding(chunks[i].content);
-        db.insertEmbedding(chunkIds[i], emb);
-        chunkIndex.add(chunkIds[i], emb);
-        embeddedCount++;
-      } catch (embErr) {
-        console.warn(`[AI] Embedding failed for chunk ${i + 1}/${chunkIds.length}: ${embErr}`);
-        // Skip this chunk's embedding but continue with the rest
-      }
-      if ((i + 1) % 50 === 0) {
-        console.log(`[AI] Document ${doc.filename}: embedded ${i + 1}/${chunkIds.length} chunks`);
-      }
+      const emb = await generateEmbedding(chunks[i].content);
+      db.insertEmbedding(chunkIds[i], emb);
+      chunkIndex.add(chunkIds[i], emb);
     }
 
-    try {
-      const docText = `${doc.filename}. ${text.slice(0, 1000)}`;
-      const docEmb = await generateEmbedding(docText);
-      db.insertNoteEmbedding(docId, docEmb);
-      noteIndex.add(docId, docEmb);
-    } catch (embErr) {
-      console.warn(`[AI] Document-level embedding failed: ${embErr}`);
-    }
+    const docText = `${doc.filename}. ${text.slice(0, 1000)}`;
+    const docEmb = await generateEmbedding(docText);
+    db.insertNoteEmbedding(docId, docEmb);
+    noteIndex.add(docId, docEmb);
 
     db.updateDocument(docId, { status: 'ready' });
-    console.log(`[AI] Document processed: ${doc.filename} (${embeddedCount}/${chunkIds.length} chunks embedded)`);
+    console.log(`[AI] Document processed: ${doc.filename} (${chunkIds.length} chunks)`);
 
     scheduleRebuildTopicsAndLinks();
   } catch (err) {
@@ -214,29 +397,19 @@ export async function processImage(imageId: string): Promise<void> {
     }
     db.updateImage(imageId, { chunk_count: chunkIds.length });
 
-    let embeddedCount = 0;
     for (let i = 0; i < chunkIds.length; i++) {
-      try {
-        const emb = await generateEmbedding(chunks[i].content);
-        db.insertEmbedding(chunkIds[i], emb);
-        chunkIndex.add(chunkIds[i], emb);
-        embeddedCount++;
-      } catch (embErr) {
-        console.warn(`[AI] Embedding failed for image chunk ${i + 1}/${chunkIds.length}: ${embErr}`);
-      }
+      const emb = await generateEmbedding(chunks[i].content);
+      db.insertEmbedding(chunkIds[i], emb);
+      chunkIndex.add(chunkIds[i], emb);
     }
 
-    try {
-      const imgText = `${img.filename}. ${text.slice(0, 1000)}`;
-      const imgEmb = await generateEmbedding(imgText);
-      db.insertNoteEmbedding(imageId, imgEmb);
-      noteIndex.add(imageId, imgEmb);
-    } catch (embErr) {
-      console.warn(`[AI] Image-level embedding failed: ${embErr}`);
-    }
+    const imgText = `${img.filename}. ${text.slice(0, 1000)}`;
+    const imgEmb = await generateEmbedding(imgText);
+    db.insertNoteEmbedding(imageId, imgEmb);
+    noteIndex.add(imageId, imgEmb);
 
     db.updateImage(imageId, { status: 'ready' });
-    console.log(`[AI] Image processed: ${img.filename} (${embeddedCount}/${chunkIds.length} chunks embedded)`);
+    console.log(`[AI] Image processed: ${img.filename} (${chunkIds.length} chunks)`);
 
     scheduleRebuildTopicsAndLinks();
   } catch (err) {
@@ -588,8 +761,8 @@ function selectRepresentativeChunks(chunks: string[], maxChunks: number): string
   return selected;
 }
 
-const RETRIEVAL_CANDIDATES = 20;
-const RETRIEVAL_TOP_K = 3;
+const RETRIEVAL_CANDIDATES = 30;
+const RETRIEVAL_TOP_K = 6;
 const CONTEXT_EXPAND_WORDS = 150;
 
 export async function retrieveChunksForChat(
@@ -668,6 +841,31 @@ interface RetrievalCandidate {
   combinedScore: number;
 }
 
+// ─── BM25-style keyword scoring ──────────────────────────────────────────────
+// Proper term frequency scoring normalized by document length,
+// replacing simple substring matching that missed paraphrased content.
+
+function bm25Score(content: string, terms: string[], k1 = 1.2, b = 0.75, avgDl = 200): number {
+  const words = content.toLowerCase().split(/\s+/);
+  const dl = words.length;
+  let score = 0;
+
+  for (const term of terms) {
+    // Term frequency in this document
+    let tf = 0;
+    for (const w of words) {
+      if (w.includes(term)) tf++;
+    }
+    if (tf === 0) continue;
+
+    // BM25 TF component (saturating term frequency)
+    const tfNorm = (tf * (k1 + 1)) / (tf + k1 * (1 - b + b * (dl / avgDl)));
+    score += tfNorm;
+  }
+
+  return terms.length > 0 ? score / terms.length : 0;
+}
+
 async function hybridRetrieve(
   sourceId: string | null,
   query: string,
@@ -675,9 +873,15 @@ async function hybridRetrieve(
   topK: number,
 ): Promise<RetrievalCandidate[]> {
   const queryEmb = await generateEmbedding(query);
-  const candidates: RetrievalCandidate[] = [];
   const queryTerms = extractSearchTerms(query);
   const allTerms = [...new Set([...queryTerms, ...expandedTerms])];
+
+  // Collect candidates with separate semantic and keyword scores
+  const rawCandidates: Array<{
+    chunkId: string; content: string; sourceId: string;
+    startOffset: number; endOffset: number;
+    semanticScore: number; keywordScore: number;
+  }> = [];
 
   if (sourceId) {
     const storedChunks = db.getChunksByNote(sourceId);
@@ -686,24 +890,11 @@ async function hybridRetrieve(
 
     for (const chunk of storedChunks) {
       const emb = embMap.get(chunk.id);
-      const semanticScore = emb ? cosineSimilarity(queryEmb, emb) : 0;
-      const lowerContent = chunk.content.toLowerCase();
-      let kwHits = 0;
-      for (const term of allTerms) {
-        if (lowerContent.includes(term)) kwHits++;
-      }
-      const keywordScore = allTerms.length > 0 ? kwHits / allTerms.length : 0;
-      const combinedScore = 0.6 * semanticScore + 0.4 * keywordScore;
-
-      candidates.push({
-        chunkId: chunk.id,
-        content: chunk.content,
-        sourceId: chunk.note_id,
-        startOffset: chunk.start_offset,
-        endOffset: chunk.end_offset,
-        semanticScore,
-        keywordScore,
-        combinedScore,
+      rawCandidates.push({
+        chunkId: chunk.id, content: chunk.content, sourceId: chunk.note_id,
+        startOffset: chunk.start_offset, endOffset: chunk.end_offset,
+        semanticScore: emb ? cosineSimilarity(queryEmb, emb) : 0,
+        keywordScore: bm25Score(chunk.content, allTerms),
       });
     }
   } else {
@@ -712,27 +903,43 @@ async function hybridRetrieve(
     const scoreMap = new Map(hits.map(h => [h.id, h.score]));
 
     for (const chunk of hitChunks) {
-      const semanticScore = scoreMap.get(chunk.id) || 0;
-      const lowerContent = chunk.content.toLowerCase();
-      let kwHits = 0;
-      for (const term of allTerms) {
-        if (lowerContent.includes(term)) kwHits++;
-      }
-      const keywordScore = allTerms.length > 0 ? kwHits / allTerms.length : 0;
-      const combinedScore = 0.6 * semanticScore + 0.4 * keywordScore;
-
-      candidates.push({
-        chunkId: chunk.id,
-        content: chunk.content,
-        sourceId: chunk.note_id,
-        startOffset: chunk.start_offset,
-        endOffset: chunk.end_offset,
-        semanticScore,
-        keywordScore,
-        combinedScore,
+      rawCandidates.push({
+        chunkId: chunk.id, content: chunk.content, sourceId: chunk.note_id,
+        startOffset: chunk.start_offset, endOffset: chunk.end_offset,
+        semanticScore: scoreMap.get(chunk.id) || 0,
+        keywordScore: bm25Score(chunk.content, allTerms),
       });
     }
   }
+
+  // ── Reciprocal Rank Fusion (RRF) ─────────────────────────────────────
+  // Instead of weighted average (0.6*sem + 0.4*kw) which collapses when
+  // one signal is weak, RRF combines RANK positions from each method.
+  // Formula: RRF(d) = Σ 1/(k + rank_i(d)) for each ranking method
+  // k=60 is standard (Cormack et al., used in production by Elasticsearch, Vespa)
+  const RRF_K = 60;
+
+  // Rank by semantic score
+  const semRanked = [...rawCandidates].sort((a, b) => b.semanticScore - a.semanticScore);
+  const semRankMap = new Map<string, number>();
+  semRanked.forEach((c, i) => semRankMap.set(c.chunkId, i + 1));
+
+  // Rank by keyword/BM25 score
+  const kwRanked = [...rawCandidates].sort((a, b) => b.keywordScore - a.keywordScore);
+  const kwRankMap = new Map<string, number>();
+  kwRanked.forEach((c, i) => kwRankMap.set(c.chunkId, i + 1));
+
+  // Compute RRF combined score
+  const candidates: RetrievalCandidate[] = rawCandidates.map(c => {
+    const semRank = semRankMap.get(c.chunkId) || rawCandidates.length;
+    const kwRank = kwRankMap.get(c.chunkId) || rawCandidates.length;
+    const rrfScore = 1 / (RRF_K + semRank) + 1 / (RRF_K + kwRank);
+
+    return {
+      ...c,
+      combinedScore: rrfScore,
+    };
+  });
 
   candidates.sort((a, b) => b.combinedScore - a.combinedScore);
   return candidates.slice(0, topK);
@@ -784,6 +991,106 @@ function rerankChunks(
 
   candidates.sort((a, b) => b.combinedScore - a.combinedScore);
   return candidates.slice(0, topK);
+}
+
+// ─── MMR Reranking (Maximal Marginal Relevance) ─────────────────────────────
+// After initial hybrid retrieval + TF-IDF rerank, apply MMR to enforce diversity.
+// Penalizes candidates that are too similar to already-selected chunks.
+// This prevents top-K from being dominated by chunks from the same section.
+
+async function mmrRerank(
+  candidates: RetrievalCandidate[],
+  topK: number,
+  lambda: number = 0.7, // 0.7 = favor relevance, 0.5 = balance diversity
+): Promise<RetrievalCandidate[]> {
+  if (candidates.length <= topK) return candidates;
+
+  // Get embeddings for all candidates
+  const embMap = new Map<string, number[]>();
+  const storedEmbs = db.getEmbeddingsByChunkIds(candidates.map(c => c.chunkId));
+  for (const e of storedEmbs) embMap.set(e.chunkId, e.vector);
+
+  const selected: RetrievalCandidate[] = [];
+  const remaining = [...candidates];
+
+  while (selected.length < topK && remaining.length > 0) {
+    let bestIdx = 0;
+    let bestScore = -Infinity;
+
+    for (let i = 0; i < remaining.length; i++) {
+      const cand = remaining[i];
+      const relevance = cand.combinedScore;
+
+      // Max similarity to any already-selected chunk
+      let maxSim = 0;
+      if (selected.length > 0) {
+        const candEmb = embMap.get(cand.chunkId);
+        if (candEmb) {
+          for (const sel of selected) {
+            const selEmb = embMap.get(sel.chunkId);
+            if (selEmb) {
+              const sim = cosineSimilarity(candEmb, selEmb);
+              if (sim > maxSim) maxSim = sim;
+            }
+          }
+        }
+      }
+
+      const mmrScore = lambda * relevance - (1 - lambda) * maxSim;
+      if (mmrScore > bestScore) {
+        bestScore = mmrScore;
+        bestIdx = i;
+      }
+    }
+
+    selected.push(remaining[bestIdx]);
+    remaining.splice(bestIdx, 1);
+  }
+
+  return selected;
+}
+
+// ─── Adjacent Chunk Expansion ────────────────────────────────────────────────
+// When chunk N is retrieved, also include chunks N-1 and N+1 from the same
+// source to handle answers that span chunk boundaries.
+
+function expandWithAdjacentChunks(
+  selected: RetrievalCandidate[],
+  allChunksForSource: Map<string, RetrievalCandidate[]>,
+): RetrievalCandidate[] {
+  const resultIds = new Set(selected.map(c => c.chunkId));
+  const expanded: RetrievalCandidate[] = [...selected];
+
+  for (const chunk of selected) {
+    const sourceChunks = allChunksForSource.get(chunk.sourceId);
+    if (!sourceChunks) continue;
+
+    // Sort source chunks by offset to find neighbors
+    const sorted = [...sourceChunks].sort((a, b) => a.startOffset - b.startOffset);
+    const idx = sorted.findIndex(c => c.chunkId === chunk.chunkId);
+    if (idx < 0) continue;
+
+    // Add N-1
+    if (idx > 0 && !resultIds.has(sorted[idx - 1].chunkId)) {
+      const prev = sorted[idx - 1];
+      resultIds.add(prev.chunkId);
+      expanded.push({ ...prev, combinedScore: prev.combinedScore * 0.7 }); // lower score for context chunks
+    }
+    // Add N+1
+    if (idx < sorted.length - 1 && !resultIds.has(sorted[idx + 1].chunkId)) {
+      const next = sorted[idx + 1];
+      resultIds.add(next.chunkId);
+      expanded.push({ ...next, combinedScore: next.combinedScore * 0.7 });
+    }
+  }
+
+  // Re-sort by offset within each source to maintain reading order
+  expanded.sort((a, b) => {
+    if (a.sourceId !== b.sourceId) return a.sourceId.localeCompare(b.sourceId);
+    return a.startOffset - b.startOffset;
+  });
+
+  return expanded;
 }
 
 interface ExpandedContext {
@@ -858,10 +1165,12 @@ function compressContext(
       return { text: s, score };
     });
 
-    let relevant = scoredSentences.filter(s => s.score > 0);
-    if (relevant.length === 0) relevant = scoredSentences;
+    // Keep ALL sentences — don't strip non-matching ones.
+    // Stripping causes answer sentences with paraphrased/implicit information
+    // to be lost before the model ever sees them. Sort by relevance but retain all.
+    const sorted = [...scoredSentences].sort((a, b) => b.score - a.score);
 
-    const deduped = relevant.filter(s => {
+    const deduped = sorted.filter(s => {
       const key = s.text.trim().toLowerCase().slice(0, 100);
       if (globalSeen.has(key)) return false;
       globalSeen.add(key);
@@ -894,9 +1203,20 @@ export async function contextualRetrieveForChat(
   const candidates = await hybridRetrieve(sourceId, rewrittenQuery, expandedTerms, RETRIEVAL_CANDIDATES);
 
   if (candidates.length > 0) {
-    const reranked = rerankChunks([...candidates], rewrittenQuery, expandedTerms, RETRIEVAL_TOP_K);
+    const reranked = rerankChunks([...candidates], rewrittenQuery, expandedTerms, RETRIEVAL_TOP_K * 2);
 
-    const expanded = expandChunkContexts(sourceId, reranked);
+    // MMR diversity enforcement — prevents all top-K from the same section
+    const mmrSelected = await mmrRerank(reranked, RETRIEVAL_TOP_K, 0.7);
+
+    // Adjacent chunk expansion — include N-1 and N+1 for boundary coverage
+    const sourceChunkMap = new Map<string, RetrievalCandidate[]>();
+    for (const c of candidates) {
+      if (!sourceChunkMap.has(c.sourceId)) sourceChunkMap.set(c.sourceId, []);
+      sourceChunkMap.get(c.sourceId)!.push(c);
+    }
+    const withAdjacent = expandWithAdjacentChunks(mmrSelected, sourceChunkMap);
+
+    const expanded = expandChunkContexts(sourceId, withAdjacent.slice(0, RETRIEVAL_TOP_K + 4));
 
     const compressed = compressContext(expanded, rewrittenQuery, expandedTerms);
 

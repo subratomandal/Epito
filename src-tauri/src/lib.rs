@@ -298,7 +298,11 @@ pub(crate) fn kill_process_tree(child: &mut Child) {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct WindowState {
     width: u32, height: u32, x: i32, y: i32, maximized: bool,
+    #[serde(default = "default_theme")]
+    theme: String,
 }
+
+fn default_theme() -> String { "dark".to_string() }
 
 fn window_state_path() -> std::path::PathBuf {
     dirs::home_dir().expect("Cannot determine home directory")
@@ -324,9 +328,21 @@ fn save_current_window_state(window: &tauri::WebviewWindow) {
     let size = match window.outer_size() { Ok(s) => s, Err(_) => return };
     let pos = match window.outer_position() { Ok(p) => p, Err(_) => return };
     let maximized = window.is_maximized().unwrap_or(false);
+    let theme = read_saved_theme();
     save_window_state(&WindowState {
-        width: size.width, height: size.height, x: pos.x, y: pos.y, maximized,
+        width: size.width, height: size.height, x: pos.x, y: pos.y, maximized, theme,
     });
+}
+
+fn theme_file_path() -> std::path::PathBuf {
+    dirs::home_dir().expect("Cannot determine home directory")
+        .join(".epito").join("theme")
+}
+
+fn read_saved_theme() -> String {
+    std::fs::read_to_string(theme_file_path())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "dark".to_string())
 }
 
 fn restore_window_state(window: &tauri::WebviewWindow) {
@@ -390,6 +406,31 @@ async fn save_file_with_dialog(
         }
         None => Ok(false),
     }
+}
+
+// ─── Theme ───────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn set_theme_color(app: tauri::AppHandle, theme: String) {
+    // Bug #12349: On macOS, Tauri may invert the backgroundColor.
+    // Try both normal and inverted to see which one works.
+    // Normal: light=white, dark=black
+    let color = if theme == "light" {
+        tauri::webview::Color(255, 255, 255, 255)
+    } else {
+        tauri::webview::Color(10, 10, 15, 255)
+    };
+
+    if let Some(window) = app.get_webview_window("main") {
+        let result = window.set_background_color(Some(color));
+        log::info!("[Theme] set_background_color({}) = {:?}", theme, result);
+    }
+
+    // Save for next launch splash
+    let path = theme_file_path();
+    if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
+    std::fs::write(&path, &theme).ok();
+    log::info!("[Theme] Set to: {}", theme);
 }
 
 // ─── Shutdown ────────────────────────────────────────────────────────────────
@@ -505,8 +546,20 @@ fn ctrlc_handler<F: FnOnce() + Send + 'static>(handler: F) -> Result<(), String>
 // ─── Splash Screen ───────────────────────────────────────────────────────
 
 fn show_splash(window: &tauri::WebviewWindow) {
-    let splash = r#"data:text/html;charset=utf-8,<!DOCTYPE html><html><head><style>*{margin:0;padding:0;box-sizing:border-box}body{display:flex;align-items:center;justify-content:center;height:100vh;background:%230a0a0f;font-family:system-ui,-apple-system,sans-serif;overflow:hidden}.c{text-align:center}.t{font-size:2.5rem;font-weight:700;color:%23fff;letter-spacing:-0.02em;animation:f .6s ease-out}.s{margin-top:1rem;display:flex;gap:6px;justify-content:center}.s span{width:6px;height:6px;border-radius:50%;background:%23555;animation:b 1.2s ease-in-out infinite}.s span:nth-child(2){animation-delay:.15s}.s span:nth-child(3){animation-delay:.3s}@keyframes f{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}@keyframes b{0%,80%,100%{opacity:.3;transform:scale(1)}40%{opacity:1;transform:scale(1.3)}}</style></head><body><div class="c"><div class="t">Epito</div><div class="s"><span></span><span></span><span></span></div></div></body></html>"#;
+    let theme = read_saved_theme();
+    let is_dark = theme != "light";
+    log::info!("[Lifecycle] Splash theme: {}", if is_dark { "dark" } else { "light" });
+
+    let bg = if is_dark { "%230a0a0f" } else { "%23ffffff" };
+
+    let splash = format!(
+        "data:text/html;charset=utf-8,<!DOCTYPE html><html><head><style>*{{margin:0;padding:0;box-sizing:border-box}}body{{height:100vh;background:{bg};overflow:hidden}}</style></head><body></body></html>",
+        bg = bg,
+    );
     let _ = window.navigate(splash.parse().unwrap());
+    // Wait for the data URL to render before showing the window.
+    // Without this, the user sees the white about:blank for ~1 second.
+    thread::sleep(Duration::from_millis(300));
     let _ = window.show();
 }
 
@@ -543,6 +596,7 @@ pub fn run() {
             llama_server::get_llama_port,
             llama_server::start_llama_lazy,
             save_file_with_dialog,
+            set_theme_color,
         ])
         .setup(move |app| {
             app.handle().plugin(
@@ -561,6 +615,16 @@ pub fn run() {
 
             if let Some(window) = app.get_webview_window("main") {
                 restore_window_state(&window);
+
+                // Set window background to match theme BEFORE splash
+                let theme = read_saved_theme();
+                let bg = if theme == "light" {
+                    tauri::webview::Color(255, 255, 255, 255)
+                } else {
+                    tauri::webview::Color(10, 10, 15, 255)
+                };
+                let _ = window.set_background_color(Some(bg));
+
                 show_splash(&window);
             }
 
@@ -670,6 +734,24 @@ pub fn run() {
                         }
                         if let Some(window) = handle_node.get_webview_window("main") {
                             let _ = window.navigate(url.parse().unwrap());
+
+                            // Inject correct theme into the webview after navigation
+                            let theme = read_saved_theme();
+                            let bg = if theme == "light" {
+                                tauri::webview::Color(255, 255, 255, 255)
+                            } else {
+                                tauri::webview::Color(10, 10, 15, 255)
+                            };
+                            let _ = window.set_background_color(Some(bg));
+
+                            // Set localStorage + html class so the app picks up the right theme
+                            let js = format!(
+                                "localStorage.setItem('theme','{}');document.documentElement.classList.remove('light','dark');document.documentElement.classList.add('{}');",
+                                theme, theme
+                            );
+                            // Small delay to let the page start loading
+                            thread::sleep(Duration::from_millis(500));
+                            let _ = window.eval(&js);
                         }
                         // Signal that the UI is loaded — llama-server can start now
                         // without competing with Node.js for disk I/O
@@ -679,33 +761,117 @@ pub fn run() {
                 }
             });
 
-            // ── Spawn llama-server (deferred until UI is ready) ──
+            // ── Runtime Controller (ChatGPT-style ephemeral worker model) ──
+            // llama-server auto-starts on boot for fast first interaction,
+            // then gets killed after 30s idle to reclaim memory. Restarts
+            // on-demand via .idle-start signal when next AI request arrives.
+            //
+            // Memory lifecycle:
+            //   Boot → spawn worker → mmap model → allocate tensors → ready
+            //   → run inference → return tokens → 10s idle → clear KV cache
+            //   → 30s idle → kill worker → idle (0 MB)
+            //   → .idle-start → respawn worker → ready
+            //
+            // Signal files (written by Node.js, consumed by this watcher):
+            //   .idle-start    → spawn llama-server (after idle kill)
+            //   .idle-stop     → kill llama-server (Tier 2: full memory reclaim)
+            //   .idle-kv-clear → clear KV cache via API (Tier 1: ~200MB freed)
             let handle_llama = app.handle().clone();
             thread::spawn(move || {
-                if !model::model_exists() {
-                    log::info!("[Lifecycle] No model — will prompt download");
-                    return;
-                }
-
-                // Wait for Node.js to be ready before starting llama-server.
-                // Loading the 4GB model competes with Node.js for disk I/O,
-                // causing the UI to feel sluggish. Deferring gives Node.js
-                // priority so the window appears fast.
-                log::info!("[Lifecycle] Waiting for Node.js before starting llama-server...");
+                // Wait for Node.js before starting — prevents disk I/O contention
+                // that causes the UI to feel sluggish during initial load.
                 while !NODE_READY.load(Ordering::Acquire) {
                     if SHUTTING_DOWN.load(Ordering::Relaxed) { return; }
                     thread::sleep(Duration::from_millis(100));
                 }
-                log::info!("[Lifecycle] Node.js ready — starting llama-server now");
 
-                let llama_state = handle_llama.state::<llama_server::LlamaProcess>();
-                match llama_server::start(&handle_llama, &llama_state, llama_port) {
-                    Ok(port) => {
-                        if !llama_server::wait_ready(port, Duration::from_secs(120)) {
-                            log::error!("[Lifecycle] llama-server timeout (120s)");
+                // Auto-start llama-server on boot (if model exists)
+                // This ensures the UI shows "AI ready" quickly.
+                // The two-tier idle system reclaims memory after 30s of no AI use.
+                if model::model_exists() {
+                    log::info!("[Lifecycle] Node.js ready — starting llama-server");
+                    let llama_state = handle_llama.state::<llama_server::LlamaProcess>();
+                    match llama_server::start(&handle_llama, &llama_state, llama_port) {
+                        Ok(port) => {
+                            if !llama_server::wait_ready(port, Duration::from_secs(120)) {
+                                log::error!("[Lifecycle] llama-server timeout (120s)");
+                            }
+                        }
+                        Err(e) => log::warn!("[Lifecycle] llama-server: {}", e),
+                    }
+                } else {
+                    log::info!("[Lifecycle] No model — will start on demand after download");
+                }
+
+                log::info!("[Lifecycle] Runtime controller started (two-tier idle reclaim)");
+
+                let idle_data_dir = model::data_dir();
+                std::fs::create_dir_all(&idle_data_dir).ok();
+                let stop_signal = idle_data_dir.join(".idle-stop");
+                let start_signal = idle_data_dir.join(".idle-start");
+                let kv_clear_signal = idle_data_dir.join(".idle-kv-clear");
+
+                // Clean stale signals from previous run
+                let _ = std::fs::remove_file(&stop_signal);
+                let _ = std::fs::remove_file(&start_signal);
+                let _ = std::fs::remove_file(&kv_clear_signal);
+
+                loop {
+                    if SHUTTING_DOWN.load(Ordering::Relaxed) { break; }
+                    thread::sleep(Duration::from_secs(1));
+
+                    // ── Tier 2: Full process kill (30s idle) ──
+                    // Releases ALL memory: model weights + KV cache + GPU VRAM.
+                    // OS reclaims everything when the process exits.
+                    if stop_signal.exists() {
+                        let _ = std::fs::remove_file(&stop_signal);
+                        let llama_state = handle_llama.state::<llama_server::LlamaProcess>();
+                        if llama_server::is_running(&llama_state) {
+                            log::info!("[Lifecycle] Tier 2: Killing llama-server (idle timeout). Full memory reclaim.");
+                            llama_server::stop(&llama_state);
                         }
                     }
-                    Err(e) => log::warn!("[Lifecycle] llama-server: {}", e),
+
+                    // ── Tier 1: KV cache clear (10s idle) ──
+                    // Frees ~200MB of attention cache. Model weights stay mapped.
+                    // Process stays alive for fast restart on next request.
+                    if kv_clear_signal.exists() {
+                        let _ = std::fs::remove_file(&kv_clear_signal);
+                        let llama_state = handle_llama.state::<llama_server::LlamaProcess>();
+                        if llama_server::is_running(&llama_state) {
+                            let port = llama_server::get_port(&llama_state);
+                            if port > 0 {
+                                let _ = reqwest::blocking::Client::new()
+                                    .post(format!("http://127.0.0.1:{}/slots/0?action=erase", port))
+                                    .timeout(Duration::from_secs(2))
+                                    .send();
+                                log::info!("[Lifecycle] Tier 1: KV cache cleared via signal. ~200MB freed.");
+                            }
+                        }
+                    }
+
+                    // ── On-demand worker spawn ──
+                    // Node.js writes .idle-start when ensureLlamaRunning() detects
+                    // the server is down. This spawns a new worker process.
+                    if start_signal.exists() {
+                        let _ = std::fs::remove_file(&start_signal);
+                        let llama_state = handle_llama.state::<llama_server::LlamaProcess>();
+                        if !llama_server::is_running(&llama_state) && model::model_exists() {
+                            log::info!("[Lifecycle] Spawning llama-server worker (on-demand)");
+                            match llama_server::start(&handle_llama, &llama_state, llama_port) {
+                                Ok(port) => {
+                                    if llama_server::wait_ready(port, Duration::from_secs(120)) {
+                                        log::info!("[Lifecycle] Worker ready — inference available");
+                                    } else {
+                                        log::error!("[Lifecycle] Worker timeout (120s) — model may be too large");
+                                    }
+                                }
+                                Err(e) => log::warn!("[Lifecycle] Worker spawn failed: {}", e),
+                            }
+                        } else if !model::model_exists() {
+                            log::warn!("[Lifecycle] Start signal received but no model downloaded");
+                        }
+                    }
                 }
             });
 
@@ -719,7 +885,10 @@ pub fn run() {
                     label, event: tauri::WindowEvent::CloseRequested { .. }, ..
                 } => {
                     if label == "main" {
-                        // Trigger full shutdown on window close, not just on Exit
+                        // Hide window immediately for clean close (no visual glitches)
+                        if let Some(w) = app_handle.get_webview_window("main") {
+                            let _ = w.hide();
+                        }
                         perform_shutdown(app_handle);
                     }
                 }
