@@ -750,7 +750,7 @@ export function getGreetingResponse(): string {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 type ChatMessage = { role: string; content: string };
-type ChatIntent = 'EXHAUSTIVE_LIST' | 'PERSON_QUERY' | 'FACT_LOOKUP' | 'SUMMARY_REQUEST' | 'COMPARISON' | 'FOLLOW_UP' | 'CORRECTION' | 'TOPIC_CHANGE';
+type ChatIntent = 'EXHAUSTIVE_LIST' | 'PERSON_QUERY' | 'FACT_LOOKUP' | 'YES_NO' | 'SUMMARY_REQUEST' | 'COMPARISON' | 'FOLLOW_UP' | 'CORRECTION' | 'TOPIC_CHANGE';
 
 const TOKEN_BUDGET = { system: 250, summary: 100, context: 800, recentChat: 500, query: 150 };
 const CHAT_MAX_TOKENS = 250;
@@ -822,6 +822,8 @@ function classifyIntent(msg: string, isCorrection: boolean): ChatIntent {
   if (/\bwho is\b|\bwho was\b|\babout .+ person\b/.test(m)) return 'PERSON_QUERY';
   if (/\bcompare\b|\bversus\b|\bvs\b|\bdifference between\b/.test(m)) return 'COMPARISON';
   if (/\bsummar|\boverview\b|\bbrief\b|\btl;?dr\b/.test(m)) return 'SUMMARY_REQUEST';
+  // Yes/No: starts with "is", "does", "did", "was", "are", "has", "can", "will"
+  if (/^(is|does|did|was|are|has|have|can|could|will|would|should)\b/i.test(m.trim())) return 'YES_NO';
   if (/\b(this|that|it|the other|here|there|above|those)\b/.test(m) && m.split(/\s+/).length < 10) return 'FOLLOW_UP';
   if (/\b(forget|stop talking about|different topic|change subject|anyway|moving on)\b/.test(m)) return 'TOPIC_CHANGE';
   return 'FACT_LOOKUP';
@@ -949,17 +951,45 @@ function buildTwoTierSummary(rollingSummary: string): string {
   return truncTk(parts.join('\n'), TOKEN_BUDGET.summary);
 }
 
-// ─── Step 7: Prompt Assembly ─────────────────────────────────────────────────
+// ─── Step 7: Prompt Assembly & Response Design ──────────────────────────────
+// System prompt: exactly 6 rules, <200 tokens. Each rule prevents a documented failure.
 
-const BASE_SYSTEM = `You are Epito, a note assistant. Answer using only the Relevant Notes section. Be concise. If the answer is not in the notes, say "I don't have that information in your notes."
+const BASE_SYSTEM = `You are Epito, a personal note assistant. You answer questions using ONLY the user's notes provided in the Relevant Notes section.
 
 Rules:
-- Do not invent facts not present in the notes.
-- Do not repeat your previous answers.
-- If the user corrects you, acknowledge it and fix your answer.
-- When asked to list ALL of something, scan every chunk and extract every instance. Do not stop at the first match.`;
+1. If the answer is in the notes, give it directly. Be specific. Cite which note.
+2. If the answer is NOT in the notes, say: "I don't have that in your notes." Do not guess.
+3. If the notes contain conflicting information, present both and tell the user.
+4. Never invent facts, dates, names, or numbers not present in the notes.
+5. Match your response length to the question. Short questions get short answers.
+6. When listing items, list ALL of them. Do not stop at the first one.`;
 
-const GROUNDING = `Respond using only the information in Relevant Notes and Recent Chat. If the answer is not there, say you don't have that information.`;
+const GROUNDING = `Answer using only the notes above. If the information is not there, say you don't have it. When stating a fact, cite the note name in parentheses.`;
+
+// Intent-specific prompt additions (one-liner per intent, appended to user query)
+const INTENT_PROMPTS: Record<ChatIntent, string> = {
+  FACT_LOOKUP: 'Answer in one sentence. State the fact and which note it comes from.',
+  YES_NO: 'Answer YES or NO first, then give one sentence of evidence from the notes.',
+  EXHAUSTIVE_LIST: 'List every instance found in the notes. One per line. Include the source note. Do not stop until all instances are listed.',
+  PERSON_QUERY: 'Describe this person based only on what the notes say. List their specific contributions or roles mentioned. Cite the source note for each fact.',
+  COMPARISON: 'Compare using specific data from the notes. If the notes contain numbers, use them. State which is better and why based on the data.',
+  SUMMARY_REQUEST: 'Give a concise overview based on the notes. Cover the main points in 3-4 sentences.',
+  FOLLOW_UP: '',
+  CORRECTION: 'The user corrected your previous answer. Acknowledge this and provide the right information using the notes.',
+  TOPIC_CHANGE: '',
+};
+
+const INTENT_MAX_TOKENS: Record<ChatIntent, number> = {
+  FACT_LOOKUP: 60,
+  YES_NO: 40,
+  EXHAUSTIVE_LIST: 200,
+  PERSON_QUERY: 150,
+  COMPARISON: 200,
+  SUMMARY_REQUEST: 150,
+  FOLLOW_UP: 150,
+  CORRECTION: 150,
+  TOPIC_CHANGE: 150,
+};
 
 function buildMessages(
   context: string, summary: string, recent: ChatMessage[], query: string,
@@ -968,10 +998,10 @@ function buildMessages(
   let sys = BASE_SYSTEM;
 
   if (flags.frustrated) {
-    sys = `Your previous answers were wrong. Read the Relevant Notes section carefully. Answer only what the user is currently asking. Do not reference previous topics.\n\n${sys}`;
+    sys = `Give a direct answer to the user's question. Do not apologize. Do not reference previous answers. Just answer correctly.\n\n${sys}`;
   }
   if (flags.isCorrection) {
-    sys += `\nThe user has corrected your previous answer. Acknowledge this and provide the right information.`;
+    // Rule already in INTENT_PROMPTS.CORRECTION, no need to bloat system prompt
   }
   for (const e of excludedEntities) {
     sys += `\nDo not mention ${e} unless the user specifically asks about them.`;
@@ -982,17 +1012,57 @@ function buildMessages(
   if (summary) {
     sys += `\n\n### Previous Context (background only, NOT the current topic)\nThe following is background from earlier. Do not reference it unless asked.\n${summary}`;
   }
-  if (context) {
+
+  // Relevant Notes: explicit "no results" when empty (prevents hallucination from training data)
+  if (context && context.trim()) {
     sys += `\n\n### Relevant Notes\n${context}`;
+  } else {
+    sys += `\n\n### Relevant Notes\nNo matching notes found for this question.`;
   }
 
   const msgs: Array<{ role: string; content: string }> = [{ role: 'system', content: sys }];
   for (const m of recent) msgs.push({ role: m.role === 'user' ? 'user' : 'assistant', content: m.content });
-  msgs.push({ role: 'user', content: `${query}\n\n${GROUNDING}` });
+
+  // User query with intent-specific instruction + grounding anchor
+  const intentPrompt = INTENT_PROMPTS[flags.intent] || '';
+  const queryWithGrounding = intentPrompt
+    ? `${query}\n\n${intentPrompt}\n\n${GROUNDING}`
+    : `${query}\n\n${GROUNDING}`;
+  msgs.push({ role: 'user', content: queryWithGrounding });
+
   return msgs;
 }
 
 // ─── Step 8: Output Validation ───────────────────────────────────────────────
+
+// ─── Grounding Check (post-generation entity validation) ─────────────────────
+
+function groundingCheck(response: string, context: string): string[] {
+  if (!context || !response) return [];
+  const contextLower = context.toLowerCase();
+  const ungrounded: string[] = [];
+
+  // Extract named entities (capitalized multi-word phrases)
+  const entityRe = /[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/g;
+  let m;
+  while ((m = entityRe.exec(response)) !== null) {
+    const entity = m[0];
+    if (!contextLower.includes(entity.toLowerCase())) {
+      // Fuzzy: check if any 3+ word subsequence matches
+      const words = entity.toLowerCase().split(/\s+/);
+      const found = words.some(w => w.length > 3 && contextLower.includes(w));
+      if (!found) ungrounded.push(entity);
+    }
+  }
+
+  // Extract numbers not in context
+  const numRe = /\b\d[\d,.]+\b/g;
+  while ((m = numRe.exec(response)) !== null) {
+    if (!context.includes(m[0])) ungrounded.push(m[0]);
+  }
+
+  return ungrounded;
+}
 
 function detectLoop(text: string): boolean {
   const words = text.toLowerCase().split(/\s+/);
@@ -1041,10 +1111,11 @@ function validateOutput(text: string, query: string, context: string): 'ok' | 'e
 
 // ─── Core Pipeline ───────────────────────────────────────────────────────────
 
-function getParams(frustrated: boolean, isCorrection: boolean) {
-  if (frustrated) return { temperature: 0.1, repeat_penalty: 1.25, presence_penalty: 0.2, top_p: 0.85, top_k: 30, max_tokens: CHAT_MAX_TOKENS };
-  if (isCorrection) return { temperature: 0.15, repeat_penalty: 1.25, presence_penalty: 0.2, top_p: 0.85, top_k: 30, max_tokens: CHAT_MAX_TOKENS };
-  return { temperature: 0.2, repeat_penalty: 1.2, presence_penalty: 0.15, top_p: 0.9, top_k: 40, max_tokens: CHAT_MAX_TOKENS };
+function getParams(frustrated: boolean, isCorrection: boolean, intent: ChatIntent) {
+  const maxTk = INTENT_MAX_TOKENS[intent] || CHAT_MAX_TOKENS;
+  if (frustrated) return { temperature: 0.1, repeat_penalty: 1.25, presence_penalty: 0.2, top_p: 0.85, top_k: 30, max_tokens: maxTk };
+  if (isCorrection) return { temperature: 0.15, repeat_penalty: 1.25, presence_penalty: 0.2, top_p: 0.85, top_k: 30, max_tokens: maxTk };
+  return { temperature: 0.2, repeat_penalty: 1.2, presence_penalty: 0.15, top_p: 0.9, top_k: 40, max_tokens: maxTk };
 }
 
 async function chatPipeline(
@@ -1127,7 +1198,7 @@ async function chatPipeline(
     }
 
     // Step 7: Generation
-    const params = getParams(frustrated, isCorrection);
+    const params = getParams(frustrated, isCorrection, intent);
     const body = { messages, ...params, stream: false };
 
     const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
@@ -1158,6 +1229,30 @@ async function chatPipeline(
       } else {
         response = FALLBACK;
       }
+    }
+
+    // Grounding check: flag ungrounded entities/numbers
+    const ungrounded = groundingCheck(response, context);
+    if (ungrounded.length > 2) {
+      console.warn(`[Chat] Grounding: ${ungrounded.length} ungrounded claims: ${ungrounded.join(', ')}`);
+      // Regenerate with stricter grounding
+      const strictBody = { ...body, temperature: 0.1, max_tokens: params.max_tokens };
+      strictBody.messages = buildMessages(context, '', recent, rewritten, { ...flags, frustrated: true });
+      try {
+        const sr = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(strictBody),
+        });
+        if (sr.ok) {
+          const sd = await sr.json();
+          const strict = (sd.choices?.[0]?.message?.content || '').trim();
+          if (strict && groundingCheck(strict, context).length < ungrounded.length) {
+            response = strict;
+          }
+        }
+      } catch {}
+    } else if (ungrounded.length > 0) {
+      console.log(`[Chat] Minor grounding gaps: ${ungrounded.join(', ')}`);
     }
 
     // Track for fixation detection
@@ -1213,7 +1308,7 @@ async function* streamPipeline(
       ? [{ role: 'system', content: `Extract every item mentioned in the text. Return names only, one per line.` }, { role: 'user', content: `Text:\n${context}\n\nList:` }]
       : buildMessages(context, summary, recent, rewritten, flags);
 
-    const params = getParams(frustrated, isCorrection);
+    const params = getParams(frustrated, isCorrection, intent);
     const body = { messages, ...params, stream: true };
 
     const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
