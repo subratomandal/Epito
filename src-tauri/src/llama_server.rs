@@ -517,6 +517,11 @@ fn build_args(
         GpuBackend::Metal => {
             log::info!("[llama-server] Backend: Metal ({} layers, flash-attn)", gpu_layers);
             args.extend(["--n-gpu-layers".into(), gpu_layers.to_string()]);
+            // macOS uses older llama.cpp (b4722) where --flash-attn is a boolean flag.
+            // Windows uses b8340+ where --flash-attn takes "on"/"off" argument.
+            #[cfg(target_os = "macos")]
+            args.push("--flash-attn".into());
+            #[cfg(not(target_os = "macos"))]
             args.extend(["--flash-attn".into(), "on".into()]);
         }
         GpuBackend::Cuda => {
