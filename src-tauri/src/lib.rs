@@ -429,8 +429,8 @@ fn set_theme_color(app: tauri::AppHandle, theme: String) {
         #[cfg(windows)]
         {
             if let Ok(hwnd) = window.hwnd() {
-                native_win::apply_titlebar_theme(hwnd.0, is_dark);
-                native_win::force_titlebar_redraw(hwnd.0);
+                native_win::apply_titlebar_theme(hwnd.0 as isize, is_dark);
+                native_win::force_titlebar_redraw(hwnd.0 as isize);
             }
         }
     }
@@ -573,26 +573,22 @@ fn show_splash(window: &tauri::WebviewWindow) {
     #[cfg(windows)]
     {
         if let Ok(hwnd) = window.hwnd() {
-            native_win::apply_titlebar_theme(hwnd.0, is_dark);
+            native_win::apply_titlebar_theme(hwnd.0 as isize, is_dark);
         }
     }
 
     let bg = if is_dark { "%230a0a0f" } else { "%23ffffff" };
-    let fg = if is_dark { "%23ffffff" } else { "%23111111" };
 
-    // Splash shows "Epito" centered — matches the React BrandedSplash that plays next.
-    // Uses flexbox centering so it works at any window size and position.
+    // Solid colored background — identical to macOS splash.
+    // The animated "Epito" splash (dots → E → pito → fade) is handled by
+    // the React BrandedSplash component, which runs identically on both platforms.
+    // No text here — avoids the jarring static→animated double-appearance.
     let splash = format!(
         "data:text/html;charset=utf-8,<!DOCTYPE html><html><head><style>\
 *{{margin:0;padding:0;box-sizing:border-box}}\
-html,body{{margin:0;width:100%25;height:100%25;background:{bg};overflow:hidden;\
-display:flex;align-items:center;justify-content:center}}\
-.t{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;\
-font-weight:800;font-size:40px;color:{fg};opacity:0.9;letter-spacing:-0.02em;\
-user-select:none;-webkit-user-select:none}}\
-</style></head><body><div class='t'>Epito</div></body></html>",
+html,body{{margin:0;width:100%25;height:100%25;background:{bg};overflow:hidden}}\
+</style></head><body></body></html>",
         bg = bg,
-        fg = fg,
     );
     let _ = window.navigate(splash.parse().unwrap());
 
@@ -623,6 +619,12 @@ pub fn run() {
     if !native_win::check_single_instance() {
         std::process::exit(0);
     }
+
+    // Windows: Set Per-Monitor DPI Awareness V2 BEFORE any window creation.
+    // Guarantees crisp, sharp rendering at all display scaling levels (100-200%).
+    // Must be the first Win32 call — cannot be changed after a window exists.
+    #[cfg(windows)]
+    native_win::ensure_dpi_awareness();
 
     let node_port = find_free_port();
     NODE_PORT.store(node_port, Ordering::Relaxed);
@@ -682,7 +684,7 @@ pub fn run() {
                 #[cfg(windows)]
                 {
                     if let Ok(hwnd) = window.hwnd() {
-                        native_win::apply_titlebar_theme(hwnd.0, is_dark);
+                        native_win::apply_titlebar_theme(hwnd.0 as isize, is_dark);
                     }
                 }
 
@@ -808,7 +810,7 @@ pub fn run() {
                             #[cfg(windows)]
                             {
                                 if let Ok(hwnd) = window.hwnd() {
-                                    native_win::apply_titlebar_theme(hwnd.0, is_dark);
+                                    native_win::apply_titlebar_theme(hwnd.0 as isize, is_dark);
                                 }
                             }
 

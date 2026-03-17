@@ -419,8 +419,8 @@ pub fn apply_titlebar_theme(hwnd: isize, is_dark: bool) {
     );
 }
 
-/// Invalidate the non-client area to force a title bar repaint.
-/// Must be called after DWM attribute changes for immediate visual update.
+// Invalidate the non-client area to force a title bar repaint.
+// Must be called after DWM attribute changes for immediate visual update.
 extern "system" {
     fn SetWindowPos(hwnd: isize, after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
 }
@@ -433,5 +433,31 @@ pub fn force_titlebar_redraw(hwnd: isize) {
     if hwnd == 0 { return; }
     unsafe {
         SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    }
+}
+
+// ─── DPI Awareness ───────────────────────────────────────────────────────
+//
+// Ensures the process uses Per-Monitor DPI Awareness V2 for crisp rendering
+// at ALL Windows display scaling levels (100%, 125%, 150%, 175%, 200%).
+// Without this, Windows may bitmap-stretch the UI, causing "hazy" text.
+//
+// Tauri sets this via the application manifest, but an explicit API call
+// at process start guarantees it takes effect before any window is created.
+// If already set by manifest, the API call harmlessly returns false.
+
+extern "system" {
+    fn SetProcessDpiAwarenessContext(value: isize) -> i32;
+}
+
+pub fn ensure_dpi_awareness() {
+    // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+    // This is the highest quality DPI mode, used by Chrome, VS Code, etc.
+    let result = unsafe { SetProcessDpiAwarenessContext(-4) };
+    if result != 0 {
+        log::info!("[Windows] DPI: Per-Monitor V2 awareness set via API");
+    } else {
+        // Already set by manifest — this is the expected path
+        log::info!("[Windows] DPI: Per-Monitor V2 already active (via manifest)");
     }
 }
