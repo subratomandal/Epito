@@ -2,7 +2,7 @@
 // Splits notes into 100-word chunks, explains each one sequentially via LLM.
 // Isolated from chat and summary pipelines.
 
-import { cleanInputText, ensureLlamaRunning } from './llm';
+import { cleanInputText, ensureLlamaRunning, holdServer, releaseServer } from './llm';
 
 export type ExplainEvent =
   | { type: 'progress'; message: string }
@@ -74,61 +74,65 @@ export async function* explainSingleChunk(
   total: number,
 ): AsyncGenerator<ExplainEvent> {
   await ensureLlamaRunning();
+  holdServer();
 
   yield { type: 'progress', message: `Explaining section ${index + 1} of ${total}...` };
 
-  const body = {
-    messages: [
-      { role: 'system', content: EXPLAIN_SYSTEM },
-      { role: 'user', content: EXPLAIN_PROMPT(chunkText) },
-    ],
-    temperature: 0.7,
-    top_p: 0.9,
-    repeat_penalty: 1.1,
-    max_tokens: 400,
-    stream: true,
-  };
+  try {
+    const body = {
+      messages: [
+        { role: 'system', content: EXPLAIN_SYSTEM },
+        { role: 'user', content: EXPLAIN_PROMPT(chunkText) },
+      ],
+      temperature: 0.7,
+      top_p: 0.9,
+      repeat_penalty: 1.1,
+      max_tokens: 400,
+      stream: true,
+    };
 
-  const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`LLM error: ${res.status}`);
+    const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`LLM error: ${res.status}`);
 
-  const reader = res.body?.getReader();
-  if (!reader) throw new Error('No body');
-  const decoder = new TextDecoder();
-  let accumulated = '', buffer = '';
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error('No body');
+    const decoder = new TextDecoder();
+    let accumulated = '', buffer = '';
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split('\n');
-    buffer = lines.pop() || '';
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t || !t.startsWith('data: ')) continue;
-      const p = t.slice(6);
-      if (p === '[DONE]') continue;
-      try {
-        const d = JSON.parse(p);
-        const c = d.choices?.[0]?.delta?.content;
-        if (c) {
-          accumulated += c;
-          yield { type: 'segmentStream', text: accumulated, index, total };
-        }
-      } catch {}
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t || !t.startsWith('data: ')) continue;
+        const p = t.slice(6);
+        if (p === '[DONE]') continue;
+        try {
+          const d = JSON.parse(p);
+          const c = d.choices?.[0]?.delta?.content;
+          if (c) {
+            accumulated += c;
+            yield { type: 'segmentStream', text: accumulated, index, total };
+          }
+        } catch {}
+      }
     }
+
+    accumulated = accumulated
+      .replace(/<\/s>/g, '')
+      .replace(/<\|im_end\|>/g, '')
+      .replace(/\s*\bterminated\b\.?\s*$/i, '')
+      .trim();
+
+    yield { type: 'segmentDone', explanation: accumulated, index, total };
+  } finally {
+    releaseServer();
   }
-
-  // Strip LLM stop-token artifacts
-  accumulated = accumulated
-    .replace(/<\/s>/g, '')
-    .replace(/<\|im_end\|>/g, '')
-    .replace(/\s*\bterminated\b\.?\s*$/i, '')
-    .trim();
-
-  yield { type: 'segmentDone', explanation: accumulated, index, total };
 }

@@ -1122,8 +1122,8 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
 
           {aiAvailable === false && (
             <div className="flex items-center gap-2 px-2 py-1.5 rounded-md bg-muted/50">
-              <div className="w-3 h-3 border-[1.5px] border-muted-foreground/30 border-t-foreground rounded-full animate-spin shrink-0" />
-              <p className="text-[11px] text-muted-foreground">AI engine is loading...</p>
+              <div className="w-1.5 h-1.5 rounded-full bg-muted-foreground/40 shrink-0" />
+              <p className="text-[11px] text-muted-foreground/60">AI starts when you use it</p>
             </div>
           )}
 

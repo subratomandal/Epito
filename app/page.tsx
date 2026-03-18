@@ -79,9 +79,12 @@ export default function HomePage() {
     fetchAll();
     fetchDeletedNotes();
 
-    const savedTheme = localStorage.getItem('theme') as 'light' | 'dark' | null;
+    // Read theme from URL param (set by Tauri) or localStorage
+    const urlTheme = new URLSearchParams(window.location.search).get('theme') as 'light' | 'dark' | null;
+    const savedTheme = urlTheme || localStorage.getItem('theme') as 'light' | 'dark' | null;
     if (savedTheme) {
       setTheme(savedTheme);
+      localStorage.setItem('theme', savedTheme);
       fetch('/api/settings', {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },

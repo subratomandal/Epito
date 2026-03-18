@@ -83,7 +83,8 @@
   @apply bg-transparent p-0 text-foreground text-sm;
 }
 .tiptap hr { @apply border-border my-6; }
-.tiptap a { @apply text-primary underline underline-offset-2; }
+.tiptap a { @apply text-primary underline underline-offset-2 cursor-pointer; }
+.tiptap a:hover { @apply text-primary/80; }
 .tiptap mark { @apply bg-blue-500 text-white px-0.5 rounded; }
 .tiptap ul[data-type="taskList"] { @apply list-none pl-0; }
 .tiptap ul[data-type="taskList"] li {

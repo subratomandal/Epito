@@ -13,7 +13,7 @@ const MODEL = 'mistral-7b-instruct';
 // --- Instant Offload Architecture
 // KV cache cleared instantly after inference. Process killed after idle timeout.
 // Lifecycle: idle -> on-demand spawn -> inference -> KV clear -> idle timeout -> kill.
-const PROCESS_KILL_TIMEOUT_MS = 30_000;   // Kill process after 30s idle
+const PROCESS_KILL_TIMEOUT_MS = 7_000;    // Kill process after 7s idle
 
 // Signal file directory (shared with Rust runtime controller)
 const DATA_DIR = process.env.EPITO_DATA_DIR || path.join(os.homedir(), '.epito', 'data');
@@ -30,7 +30,7 @@ let processKillTimer: ReturnType<typeof setTimeout> | null = null;
 let llamaServerRunning = false;
 
 /** Cancel pending kill timer — called BEFORE inference to keep server alive. */
-function holdServer(): void {
+export function holdServer(): void {
   if (processKillTimer) {
     clearTimeout(processKillTimer);
     processKillTimer = null;
@@ -39,7 +39,7 @@ function holdServer(): void {
 }
 
 /** Instant KV clear + schedule process kill — called AFTER inference completes. */
-function releaseServer(): void {
+export function releaseServer(): void {
   // Tier 1: INSTANT KV cache eviction (fire-and-forget, non-blocking)
   // Frees ~200MB of attention memory immediately. Process stays alive.
   fetch(`${LLAMA_URL}/slots/0?action=erase`, {

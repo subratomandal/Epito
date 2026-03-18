@@ -25,7 +25,7 @@ import {
   List, ListOrdered, Quote, Minus, Highlighter, CheckSquare,
   FileText, Clock, CalendarPlus, Copy, Check, Search, X,
   ChevronUp, ChevronDown, AArrowUp, AArrowDown,
-  Download, FileImage, FileType,
+  Download, FileImage, FileType, Loader2,
   AlignLeft, AlignCenter, AlignRight,
 } from 'lucide-react';
 import { exportAsPDF, exportAsDOCX, exportAsImage, preloadExportLibs } from '@/inference/export';
@@ -370,7 +370,7 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
       StarterKit.configure({ codeBlock: false }),
       CodeBlockLowlight.configure({ lowlight }),
       Placeholder.configure({ placeholder: 'Start writing...', showOnlyCurrent: false }),
-      TiptapLink.configure({ openOnClick: false }),
+      TiptapLink.configure({ openOnClick: false, HTMLAttributes: { target: '_blank', rel: 'noopener noreferrer' } }),
       TaskList,
       TaskItem.configure({ nested: true }),
       Highlight,
@@ -393,6 +393,17 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
         },
         transformPastedHTML: transformPastedHTMLPipeline,
         transformPastedText: truncateLargePasteText,
+        handleClick: (_view, _pos, event) => {
+          // Cmd/Ctrl+Click opens links (Notion pattern)
+          if ((event.metaKey || event.ctrlKey) && event.target instanceof HTMLAnchorElement) {
+            const href = event.target.getAttribute('href');
+            if (href) {
+              window.open(href, '_blank', 'noopener,noreferrer');
+              return true;
+            }
+          }
+          return false;
+        },
       },
       onUpdate: () => {
         onContentDirtyRef.current();
@@ -474,19 +485,34 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
 
     const handleExport = useCallback(async (format: ExportFormat) => {
       if (!editor) return;
-      setExporting(format);
+
+      // Close dialog immediately and show full-screen spinner
+      setExportOpen(false);
       setExportError(null);
+      setExporting(format);
+
+      // Two rAF frames: first schedules paint, second guarantees it's flushed.
+      // Without this, html2canvas blocks the main thread before the spinner renders.
+      await new Promise<void>(r => {
+        requestAnimationFrame(() => {
+          requestAnimationFrame(() => r());
+        });
+      });
+
       try {
         const html = editor.getHTML();
         const noteTitle = title || 'Untitled';
         if (format === 'pdf') await exportAsPDF(html, noteTitle);
         else if (format === 'docx') await exportAsDOCX(html, noteTitle);
         else if (format === 'png') await exportAsImage(html, noteTitle);
-        setExportOpen(false);
       } catch (err) {
         console.error(`Export as ${format} failed:`, err);
+        const msg = err instanceof Error ? err.message : '';
+        setExportOpen(true);
         setExportError(
-          err instanceof Error ? err.message : `Failed to export as ${format.toUpperCase()}. Please try again.`
+          msg.includes('canvas') || msg.includes('memory') || msg.includes('size')
+            ? 'Note is too large to export. Try splitting it into smaller notes.'
+            : msg || `Failed to export as ${format.toUpperCase()}. Please try again.`
         );
       }
       setExporting(null);
@@ -791,12 +817,60 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
             </div>
           </div>
         )}
+
+        {exporting && (
+          <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/50 backdrop-blur-sm">
+            <div className="flex flex-col items-center gap-3 bg-card px-8 py-6 rounded-xl border border-border shadow-2xl">
+              <Loader2 size={24} className="animate-spin text-primary" />
+              <p className="text-sm font-medium text-foreground">
+                Exporting as {exporting.toUpperCase()}...
+              </p>
+              <p className="text-[11px] text-muted-foreground">This may take a moment</p>
+            </div>
+          </div>
+        )}
       </div>
     );
   },
 );
 
 export default NoteEditor;
+
+// Heading: if the user selects partial text within a block, split the block
+// at selection boundaries first so only the selected portion becomes a heading.
+// Without this, the entire paragraph converts (standard but unintuitive).
+function applyHeading(e: ReturnType<typeof useEditor> & {}, level: 1 | 2 | 3) {
+  const { from, to, empty } = e.state.selection;
+
+  if (empty) {
+    e.chain().focus().toggleHeading({ level }).run();
+    return;
+  }
+
+  const $from = e.state.doc.resolve(from);
+  const $to = e.state.doc.resolve(to);
+
+  // Multi-block selection or entire block selected — standard toggle
+  if (!$from.sameParent($to) || (from <= $from.start() && to >= $from.end())) {
+    e.chain().focus().toggleHeading({ level }).run();
+    return;
+  }
+
+  // Partial selection within one block — split, then heading
+  const blockEnd = $from.end();
+
+  if (to < blockEnd) {
+    e.commands.setTextSelection(to);
+    e.commands.splitBlock();
+  }
+  // from is before the split point, so position is still valid
+  if (from > $from.start()) {
+    e.commands.setTextSelection(from);
+    e.commands.splitBlock();
+  }
+  // Cursor is now in the middle block (the selected text)
+  e.commands.toggleHeading({ level });
+}
 
 // Toolbar — prevents 20+ button re-renders per keystroke
 
@@ -815,7 +889,7 @@ interface EditorToolbarProps {
   isMobile?: boolean;
 }
 
-const EditorToolbar = memo(function EditorToolbar({
+const EditorToolbar = function EditorToolbar({
   editor, searchOpen, toggleSearch, copied, copyPlainText,
   exportOpen, setExportOpen, setExportError,
   fontSize, changeFontSize, resetFontSize, isMobile,
@@ -837,9 +911,9 @@ const EditorToolbar = memo(function EditorToolbar({
       case 'align-left': e.chain().focus().setTextAlign('left').run(); break;
       case 'align-center': e.chain().focus().setTextAlign('center').run(); break;
       case 'align-right': e.chain().focus().setTextAlign('right').run(); break;
-      case 'h1': e.chain().focus().toggleHeading({ level: 1 }).run(); break;
-      case 'h2': e.chain().focus().toggleHeading({ level: 2 }).run(); break;
-      case 'h3': e.chain().focus().toggleHeading({ level: 3 }).run(); break;
+      case 'h1': applyHeading(e, 1); break;
+      case 'h2': applyHeading(e, 2); break;
+      case 'h3': applyHeading(e, 3); break;
       case 'bullet': e.chain().focus().toggleBulletList().run(); break;
       case 'ordered': e.chain().focus().toggleOrderedList().run(); break;
       case 'task': e.chain().focus().toggleTaskList().run(); break;
@@ -932,9 +1006,9 @@ const EditorToolbar = memo(function EditorToolbar({
       </button>
     </div>
   );
-});
+};
 
-// ToolBtn — uses cmd string + stable exec ref so memo actually skips re-renders
+// ToolBtn — memo skips re-render unless `active` changes
 
 const ToolBtn = memo(function ToolBtn(
   { cmd, exec, active, children, title }: {
@@ -948,7 +1022,7 @@ const ToolBtn = memo(function ToolBtn(
       title={title}
       className={cn(
         'flex items-center gap-1 px-2 py-1.5 rounded-md text-sm shrink-0',
-        active ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
+        active ? 'bg-primary/15 text-primary' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
       )}
     >
       {children}

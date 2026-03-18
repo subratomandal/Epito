@@ -30,7 +30,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <link rel="apple-touch-icon" href="/logo.png" />
         <meta name="mobile-web-app-capable" content="yes" />
         <script dangerouslySetInnerHTML={{
-          __html: `(function(){var t=localStorage.getItem('theme')||'dark';document.documentElement.classList.add(t)})()`,
+          __html: `(function(){var p=new URLSearchParams(window.location.search).get('theme');var t=p||localStorage.getItem('theme')||'dark';if(p)localStorage.setItem('theme',p);document.documentElement.classList.add(t)})()`,
         }} />
         <script dangerouslySetInnerHTML={{
           __html: `if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js')})}`,

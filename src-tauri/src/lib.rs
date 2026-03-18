@@ -660,7 +660,7 @@ pub fn run() {
                     }
                 }
 
-                window.navigate("http://127.0.0.1:3000".parse().unwrap())?;
+                window.navigate(format!("http://127.0.0.1:3000?theme={}", theme).parse().unwrap())?;
                 let _ = window.show();
                 NODE_READY.store(true, Ordering::Release);
 
@@ -818,22 +818,17 @@ pub fn run() {
                             };
                             let _ = window.set_background_color(Some(bg));
 
-                            let _ = window.navigate(url.parse().unwrap());
+                            // Pass theme via URL query param so the page has it instantly
+                            // on load — no 500ms race with localStorage injection.
+                            let themed_url = format!("{}?theme={}", url, theme);
+                            let _ = window.navigate(themed_url.parse().unwrap());
 
-                            // WebView2 navigation can reset window visual state
                             #[cfg(windows)]
                             {
                                 if let Ok(hwnd) = window.hwnd() {
                                     native_win::apply_titlebar_theme(hwnd.0 as isize, is_dark);
                                 }
                             }
-
-                            let js = format!(
-                                "localStorage.setItem('theme','{}');document.documentElement.classList.remove('light','dark');document.documentElement.classList.add('{}');",
-                                theme, theme
-                            );
-                            thread::sleep(Duration::from_millis(500));
-                            let _ = window.eval(&js);
                         }
                         NODE_READY.store(true, Ordering::Release);
                     }
