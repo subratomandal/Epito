@@ -656,17 +656,23 @@ pub fn run() {
 
             log::info!("[Lifecycle] Application starting");
 
-            // Log system diagnostics — RAM, GPU VRAM, power status.
-            // Must happen after log plugin init so output actually reaches the log.
-            // Also caches nvidia-smi VRAM info for llama-server layer calculation.
-            #[cfg(windows)]
-            native_win::log_system_diagnostics();
-
             install_signal_handlers(app.handle().clone());
 
             if let Some(window) = app.get_webview_window("main") {
                 restore_window_state(&window);
                 show_splash(&window);
+            }
+
+            // Windows: Log system diagnostics AFTER splash is visible.
+            // nvidia-smi takes 200-800ms — doing it before show_splash
+            // blocked the window from appearing, causing visible startup lag.
+            // The OnceLock in query_gpu_vram() caches the result for later use
+            // by llama-server, so this also serves as a warm-up.
+            #[cfg(windows)]
+            {
+                thread::spawn(|| {
+                    native_win::log_system_diagnostics();
+                });
             }
 
             if cfg!(debug_assertions) {
