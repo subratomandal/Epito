@@ -24,7 +24,7 @@ import {
   List, ListOrdered, Quote, Minus, Highlighter, CheckSquare,
   FileText, Clock, CalendarPlus, Copy, Check, Search, X,
   ChevronUp, ChevronDown, AArrowUp, AArrowDown,
-  Download, FileImage, FileType, Loader2,
+  Download, FileImage, FileType,
   AlignLeft, AlignCenter, AlignRight,
 } from 'lucide-react';
 import { exportAsPDF, exportAsDOCX, exportAsImage, preloadExportLibs } from '@/inference/export';
@@ -482,22 +482,20 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
     const handleExport = useCallback(async (format: ExportFormat) => {
       if (!editor) return;
 
-      // Close dialog immediately and show full-screen spinner
+      // Close dialog, show spinner
       setExportOpen(false);
       setExportError(null);
       setExporting(format);
 
-      // Two rAF frames: first schedules paint, second guarantees it's flushed.
-      // Without this, html2canvas blocks the main thread before the spinner renders.
-      await new Promise<void>(r => {
-        requestAnimationFrame(() => {
-          requestAnimationFrame(() => r());
-        });
-      });
+      // Let React paint the spinner before any blocking work
+      await new Promise<void>(r => setTimeout(r, 50));
 
       try {
         const html = editor.getHTML();
         const noteTitle = title || 'Untitled';
+
+        // exportAs* functions include downloadBlob which shows the native save dialog.
+        // The await here keeps the spinner visible until the save dialog closes.
         if (format === 'pdf') await exportAsPDF(html, noteTitle);
         else if (format === 'docx') await exportAsDOCX(html, noteTitle);
         else if (format === 'png') await exportAsImage(html, noteTitle);
@@ -510,8 +508,10 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
             ? 'Note is too large to export. Try splitting it into smaller notes.'
             : msg || `Failed to export as ${format.toUpperCase()}. Please try again.`
         );
+      } finally {
+        // Always clear spinner, even on error
+        setExporting(null);
       }
-      setExporting(null);
     }, [editor, title]);
 
     const runSearch = useCallback((query: string, goToIdx?: number) => {
@@ -817,7 +817,7 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
         {exporting && (
           <div className="fixed inset-0 z-[10000] flex items-center justify-center bg-black/50 backdrop-blur-sm">
             <div className="flex flex-col items-center gap-3 bg-card px-8 py-6 rounded-xl border border-border shadow-2xl">
-              <Loader2 size={24} className="animate-spin text-primary" />
+              <div className="w-6 h-6 border-[2.5px] border-muted-foreground/20 border-t-primary rounded-full animate-spin" />
               <p className="text-sm font-medium text-foreground">
                 Exporting as {exporting.toUpperCase()}...
               </p>

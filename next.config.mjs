@@ -2,7 +2,7 @@
 const config = {
   output: 'standalone',
   experimental: {
-    serverComponentsExternalPackages: ['better-sqlite3', '@xenova/transformers', 'onnxruntime-node', 'sharp', 'tesseract.js', 'pdf-parse', 'mammoth'],
+    serverComponentsExternalPackages: ['better-sqlite3', '@xenova/transformers', 'onnxruntime-node', 'sharp', 'tesseract.js', 'pdf-parse', 'mammoth', 'puppeteer-core'],
   },
   webpack: (config, { isServer }) => {
     if (isServer) {
@@ -10,6 +10,7 @@ const config = {
       config.externals.push(
         'better-sqlite3', '@xenova/transformers', 'onnxruntime-node',
         'pdf-parse', 'mammoth', 'tesseract.js', 'sharp', 'encoding',
+        'puppeteer-core',
       );
     }
     return config;

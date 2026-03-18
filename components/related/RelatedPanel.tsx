@@ -763,7 +763,7 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
     explainOneChunk(explainIdxRef.current);
   }, [explainOneChunk]);
 
-  const runExplain = useCallback(async (hardRefresh = false) => {
+  const runExplain = useCallback(async (_hardRefresh = false) => {
     if (!noteId || !hasContent) return;
     const docId = noteId;
     const signal = abortRef.current.signal;

@@ -52,7 +52,6 @@ export async function POST(request: NextRequest) {
     }
 
     const isDoc = DOC_EXTENSIONS.has(ext);
-    const isImg = IMG_EXTENSIONS.has(ext);
 
     const buffer = Buffer.from(await file.arrayBuffer());
     await mkdir(UPLOAD_DIR, { recursive: true });

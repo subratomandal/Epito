@@ -1,6 +1,4 @@
-import { extractFocusedContext } from './answer-engine';
-import { generateEmbedding } from '@/memory/embeddings';
-import { cosineSimilarity } from '@/memory/vector';
+import { contextualRetrieveForChat } from '@/inference/pipeline';
 import * as db from '@/notes/database';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -399,18 +397,6 @@ const SYSTEM_PROMPT = `You are a world-class analyst. Produce comprehensive, ins
 // Centroid-based: TextRank select -> embed -> k-means cluster -> per-cluster LLM -> global synthesis.
 // 5-9 LLM calls total.
 
-const SUMMARY_PARAMS = { temperature: 0.6, repeat_penalty: 1.1, top_p: 0.9, top_k: 50 };
-
-// --- Length Router
-
-type SumStrategy = 'passthrough' | 'direct' | 'hierarchical';
-
-function routeNote(wordCount: number): SumStrategy {
-  if (wordCount <= 300) return 'passthrough';
-  if (wordCount <= 800) return 'direct';
-  return 'hierarchical';
-}
-
 // --- Sentence Segmentation
 
 function smartSplitSentences(text: string): string[] {
@@ -421,141 +407,9 @@ function smartSplitSentences(text: string): string[] {
     .filter(s => s.length > 0);
 }
 
-// --- Two-Phase Sentence Ranking
-// Phase 1: TextRank (zero model calls) -> top 60. Phase 2: embed only those for clustering.
-
-function textRankSelect(sentences: string[], topN: number): { sentence: string; index: number; score: number }[] {
-  const n = sentences.length;
-  if (n <= topN) return sentences.map((s, i) => ({ sentence: s, index: i, score: 1 }));
-
-  // Word overlap similarity matrix (zero model calls)
-  const wordSets = sentences.map(s => new Set(s.toLowerCase().split(/\s+/).filter(w => w.length > 3)));
-  const sim: number[][] = Array.from({ length: n }, () => new Array(n).fill(0));
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      const a = wordSets[i], b = wordSets[j];
-      if (a.size === 0 || b.size === 0) continue;
-      let inter = 0;
-      for (const w of a) if (b.has(w)) inter++;
-      const score = inter / (a.size + b.size - inter);
-      if (score > 0.1) { sim[i][j] = score; sim[j][i] = score; }
-    }
-  }
-
-  // PageRank (20 iterations, damping 0.85)
-  let scores = new Array(n).fill(1 / n);
-  for (let iter = 0; iter < 20; iter++) {
-    const next = new Array(n).fill(0);
-    for (let i = 0; i < n; i++) {
-      for (let j = 0; j < n; j++) {
-        if (i === j) continue;
-        const rowSum = sim[j].reduce((a, b) => a + b, 0);
-        if (rowSum > 0) next[i] += 0.85 * (sim[j][i] / rowSum) * scores[j];
-      }
-      next[i] += 0.15 / n;
-    }
-    scores = next;
-  }
-
-  // Boost entity-containing and first sentences
-  const ENTITY_RE = /[A-Z][a-z]+(?:\s+[A-Z][a-z]+)+/;
-  const NUMBER_RE = /\d+/;
-  for (let i = 0; i < n; i++) {
-    if (i === 0) scores[i] *= 1.3;
-    if (ENTITY_RE.test(sentences[i])) scores[i] *= 1.15;
-    if (NUMBER_RE.test(sentences[i])) scores[i] *= 1.1;
-    const wc = sentences[i].split(/\s+/).length;
-    if (wc < 5) scores[i] *= 0.5;
-  }
-
-  const ranked = scores.map((s, i) => ({ sentence: sentences[i], index: i, score: s }));
-  ranked.sort((a, b) => b.score - a.score);
-  return ranked.slice(0, topN);
-}
-
-async function embedSelectedSentences(
-  selected: { sentence: string; index: number; score: number }[],
-): Promise<{ sentence: string; index: number; score: number; embedding: number[] }[]> {
-  // Embed ONLY the pre-selected sentences (40-60, not all 150+)
-  const results: { sentence: string; index: number; score: number; embedding: number[] }[] = [];
-  for (const item of selected) {
-    const emb = await generateEmbedding(item.sentence);
-    results.push({ ...item, embedding: emb });
-  }
-  return results;
-}
-
-// --- K-Means Topic Clustering
-// Groups sentences into topic clusters for full-document coverage.
-
-function kMeansCluster(
-  items: { embedding: number[]; sentence: string; index: number }[],
-  k: number,
-  maxIter = 20,
-): { sentence: string; index: number }[][] {
-  if (items.length <= k) return items.map(item => [item]);
-
-  const dim = items[0].embedding.length;
-
-  // Initialize centroids using k-means++ (spread-out initialization)
-  const centroids: number[][] = [];
-  centroids.push([...items[0].embedding]);
-  for (let c = 1; c < k; c++) {
-    let maxDist = -1;
-    let bestIdx = 0;
-    for (let i = 0; i < items.length; i++) {
-      let minDist = Infinity;
-      for (const cent of centroids) {
-        const d = 1 - cosineSimilarity(items[i].embedding, cent);
-        if (d < minDist) minDist = d;
-      }
-      if (minDist > maxDist) { maxDist = minDist; bestIdx = i; }
-    }
-    centroids.push([...items[bestIdx].embedding]);
-  }
-
-  // Iterate
-  let assignments = new Array(items.length).fill(0);
-  for (let iter = 0; iter < maxIter; iter++) {
-    // Assign each item to nearest centroid
-    const newAssignments = items.map((item, i) => {
-      let bestCluster = 0;
-      let bestSim = -Infinity;
-      for (let c = 0; c < k; c++) {
-        const sim = cosineSimilarity(item.embedding, centroids[c]);
-        if (sim > bestSim) { bestSim = sim; bestCluster = c; }
-      }
-      return bestCluster;
-    });
-
-    // Check convergence
-    if (newAssignments.every((a, i) => a === assignments[i])) break;
-    assignments = newAssignments;
-
-    // Update centroids
-    for (let c = 0; c < k; c++) {
-      const members = items.filter((_, i) => assignments[i] === c);
-      if (members.length === 0) continue;
-      for (let d = 0; d < dim; d++) {
-        centroids[c][d] = members.reduce((sum, m) => sum + m.embedding[d], 0) / members.length;
-      }
-    }
-  }
-
-  // Group items by cluster, sorted by original document order within each
-  const clusters: { sentence: string; index: number }[][] = Array.from({ length: k }, () => []);
-  for (let i = 0; i < items.length; i++) {
-    clusters[assignments[i]].push({ sentence: items[i].sentence, index: items[i].index });
-  }
-  // Sort within each cluster by document order
-  for (const cluster of clusters) cluster.sort((a, b) => a.index - b.index);
-  // Remove empty clusters and sort clusters by earliest sentence
-  return clusters.filter(c => c.length > 0).sort((a, b) => a[0].index - b[0].index);
-}
-
 // --- Summary Validation
 
-function validateSummary(summary: string, source: string): string {
+function validateSummary(summary: string, _source: string): string {
   if (!summary || summary.trim().length < 10) return '';
 
   const sentences = summary.split(/(?<=[.!?])\s+/);
@@ -728,86 +582,6 @@ export async function summarizeChunks(chunks: string[]): Promise<{ summary: stri
 // --- Extractive-Abstractive Pipeline
 // Segment -> rank -> cluster -> per-cluster LLM -> entity extraction -> global synthesis
 
-async function extractiveAbstractivePipeline(text: string): Promise<{
-  clusterSummaries: string[];
-  entityContext: string;
-}> {
-  // Step 1: Sentence segmentation
-  const sentences = smartSplitSentences(text);
-  console.log(`[Summary] Pipeline: ${sentences.length} sentences`);
-
-  // Step 2a: TextRank selection (ZERO model calls, ~50ms)
-  const topN = Math.min(50, sentences.length);
-  const textRankSelected = textRankSelect(sentences, topN);
-  console.log(`[Summary] TextRank: ${sentences.length} → ${textRankSelected.length} top sentences (zero compute)`);
-
-  // Step 2b: Embed ONLY the selected sentences for clustering (~40 embeddings, not 150+)
-  const ranked = await embedSelectedSentences(textRankSelected);
-  console.log(`[Summary] Embedded ${ranked.length} sentences for clustering`);
-
-  // Step 3: Topic clustering — group into 4-8 topic clusters
-  const k = Math.min(Math.max(4, Math.ceil(ranked.length / 6)), 8);
-  const clusters = kMeansCluster(ranked, k);
-  console.log(`[Summary] K-means: ${ranked.length} sentences → ${clusters.length} topic clusters`);
-
-  // Step 4: Per-cluster LLM summaries
-  const clusterSummaries: string[] = [];
-  for (let i = 0; i < clusters.length; i++) {
-    const clusterText = clusters[i].map(s => s.sentence).join(' ');
-    const prompt = `Summarize the following text in 3-5 sentences. Preserve ALL names of people, organizations, institutions, dates, and technologies. Explain relationships between entities.\n\nText:\n${clusterText}\n\nSummary:`;
-    const res = await callLLM(prompt, SYSTEM_PROMPT, 200);
-    clusterSummaries.push(cleanSummaryOutput(res));
-    if (i < clusters.length - 1) await new Promise(r => setTimeout(r, 150));
-  }
-
-  // Step 5: Entity extraction from all cluster summaries
-  const allSummaryText = clusterSummaries.join(' ');
-  const entities: string[] = [];
-  const orgRe = /[A-Z][a-z]+(?:\s+(?:[A-Z][a-z]+|of|the|and|for))*\s+(?:University|Institute|College|Academy|Inc|Corp|Ltd|Foundation)/g;
-  const personRe = /[A-Z][a-z]{1,15}\s+(?:[A-Z]\.?\s+)?[A-Z][a-z]{1,15}/g;
-  let m;
-  while ((m = orgRe.exec(allSummaryText)) !== null) entities.push(m[0]);
-  while ((m = personRe.exec(allSummaryText)) !== null) entities.push(m[0]);
-  const uniqueEntities = [...new Set(entities)];
-  const entityContext = uniqueEntities.length > 0
-    ? `Key entities mentioned: ${uniqueEntities.slice(0, 20).join(', ')}`
-    : '';
-
-  console.log(`[Summary] ${clusters.length} cluster summaries, ${uniqueEntities.length} entities extracted`);
-  return { clusterSummaries, entityContext };
-}
-
-function buildGlobalSynthesisPrompt(clusterSummaries: string[], entityContext: string): string {
-  const sections = clusterSummaries.map((s, i) => `[Topic ${i + 1}] ${s}`).join('\n\n');
-  let prompt = `You are writing a comprehensive summary of an entire document.\n\n`;
-  if (entityContext) prompt += `${entityContext}\n\n`;
-  prompt += `Topic summaries from different parts of the document:\n${sections}\n\n`;
-  prompt += `Write a detailed, coherent summary (aim for 400-800 words) that:\n`;
-  prompt += `- Explains the overall topic and purpose of the document\n`;
-  prompt += `- Identifies ALL key people, organizations, and their relationships\n`;
-  prompt += `- Covers every topic above — do not skip any section\n`;
-  prompt += `- Explains the meaning and significance, not just facts\n`;
-  prompt += `- Does NOT repeat the same information twice\n`;
-  prompt += `- Reads as a single coherent narrative, not a list of bullet points\n\nSummary:`;
-  return prompt;
-}
-
-async function hierarchicalSummarize(text: string): Promise<{ summary: string; keyPoints: string[] }> {
-  const { clusterSummaries, entityContext } = await extractiveAbstractivePipeline(text);
-  const globalPrompt = buildGlobalSynthesisPrompt(clusterSummaries, entityContext);
-  const result = await callLLM(globalPrompt, SYSTEM_PROMPT, 1300);
-  const validated = validateSummary(result, text);
-  return {
-    summary: validated || clusterSummaries.join(' '),
-    keyPoints: [],
-  };
-}
-
-function truncTkSum(text: string, max: number): string {
-  const w = text.split(/\s+/), m = Math.floor(max / 1.3);
-  return w.length <= m ? text : w.slice(0, m).join(' ') + '...';
-}
-
 const EXPLAIN_PROMPT = (sentenceBlock: string, count: number) =>
 `You are an expert tutor explaining text to a curious, intelligent reader.
 
@@ -961,7 +735,6 @@ const TOKEN_BUDGET = { system: 250, summary: 100, context: 1400, recentChat: 400
 const CHAT_MAX_TOKENS = 1024;
 const MAX_RECENT = 6; // 3 turns
 const KV_RESET_INTERVAL = 6;
-const FALLBACK = "I couldn't find an answer in your notes for this.";
 
 // Session state
 let cachedSummary = '';
@@ -977,73 +750,8 @@ const pinnedFacts: string[] = [];
 // --- Entity Context Builder
 // Builds structured relationship graph from entity index to prevent entity relation collapse.
 
-function buildEntityContext(query: string): string {
-  try {
-    // Get all entities from the database for any relevant documents
-    const allEntities = db.searchEntities('%', undefined);
-    if (allEntities.length === 0) return '';
-
-    // Group entities by type
-    const byType = new Map<string, Set<string>>();
-    const entityDocs = new Map<string, string>(); // entity → document_id
-
-    for (const e of allEntities) {
-      const type = e.entity_type;
-      if (!byType.has(type)) byType.set(type, new Set());
-      byType.get(type)!.add(e.entity_name);
-      entityDocs.set(e.entity_name.toLowerCase(), e.document_id);
-    }
-
-    // Build relationship lines
-    const lines: string[] = [];
-
-    const orgs = byType.get('ORG');
-    const people = byType.get('PERSON');
-    const tools = byType.get('TOOL');
-
-    // Find co-occurring entities (same document = likely related)
-    if (people && people.size > 0 && orgs && orgs.size > 0) {
-      for (const person of people) {
-        const personDoc = entityDocs.get(person.toLowerCase());
-        if (!personDoc) continue;
-        const relatedOrgs: string[] = [];
-        for (const org of orgs) {
-          if (entityDocs.get(org.toLowerCase()) === personDoc) {
-            relatedOrgs.push(org);
-          }
-        }
-        if (relatedOrgs.length > 0 && relatedOrgs.length <= 3) {
-          lines.push(`${person} → ${relatedOrgs.join(', ')}`);
-        }
-      }
-    }
-
-    // If no relationships found, just list entity groups
-    if (lines.length === 0) {
-      if (people && people.size > 0 && people.size <= 20) {
-        lines.push(`People: ${[...people].join(', ')}`);
-      }
-      if (orgs && orgs.size > 0 && orgs.size <= 15) {
-        lines.push(`Organizations: ${[...orgs].join(', ')}`);
-      }
-      if (tools && tools.size > 0 && tools.size <= 15) {
-        lines.push(`Tools: ${[...tools].join(', ')}`);
-      }
-    }
-
-    if (lines.length === 0) return '';
-
-    // Truncate to avoid blowing context budget
-    const result = lines.slice(0, 20).join('\n');
-    return truncTk(result, 200);
-  } catch {
-    return '';
-  }
-}
-
 // --- Helpers
 
-function countTk(text: string): number { return Math.ceil(text.split(/\s+/).length * 1.3); }
 function truncTk(text: string, max: number): string {
   const w = text.split(/\s+/), m = Math.floor(max / 1.3);
   return w.length <= m ? text : w.slice(0, m).join(' ') + '...';
@@ -1126,108 +834,7 @@ async function rewriteQuery(raw: string, recent: ChatMessage[]): Promise<string>
   return raw;
 }
 
-async function decomposeQuery(query: string): Promise<string[]> {
-  const result = await quickCall(
-    `The user wants a complete list. Generate 3 different search queries that would find all instances from different parts of a document. Each query should use different keywords.\n\nOriginal: ${query}\n\nOutput 3 queries, one per line:`,
-    80
-  );
-  const variants = result.split('\n').map(l => l.replace(/^\d+[\.\)]\s*/, '').trim()).filter(l => l.length > 3);
-  return variants.length > 0 ? [query, ...variants.slice(0, 3)] : [query];
-}
-
 // --- Context Compression
-
-// --- Context Sufficiency Gate
-// Insufficient context worsens hallucination (ICLR 2025). Force abstention below threshold.
-
-type ContextSufficiency = 'SUFFICIENT' | 'LOW' | 'INSUFFICIENT' | 'NO_CONTEXT';
-
-function checkContextSufficiency(chunks: string[], avgScore: number): ContextSufficiency {
-  if (chunks.length === 0) return 'NO_CONTEXT';
-  if (avgScore < 0.25) return 'INSUFFICIENT';
-  if (avgScore < 0.45) return 'LOW';
-  return 'SUFFICIENT';
-}
-
-// --- Negation Handling (code-based, no model)
-// 7B models fail at negation; detect it and compute complement in code.
-
-const NEGATION_RE = /\b(not|n'?t|never|no|none|neither|nor|except|other than|besides|excluding|without)\b.*\b(mention|include|list|appear|use|contain|have|reference)\b/i;
-
-function hasNegation(query: string): boolean {
-  return NEGATION_RE.test(query);
-}
-
-// --- Numerical Query Detection (code computes, not model)
-
-const NUMERICAL_RE = /\b(average|mean|sum|total|count|how many|percentage|ratio|maximum|minimum|max|min|fastest|slowest|highest|lowest)\b/i;
-
-function isNumericalQuery(query: string): boolean {
-  return NUMERICAL_RE.test(query);
-}
-
-function extractNumbersFromText(text: string): number[] {
-  const matches = text.match(/\b\d[\d,.]*\b/g) || [];
-  return matches.map(m => parseFloat(m.replace(/,/g, ''))).filter(n => !isNaN(n) && isFinite(n));
-}
-
-function computeNumerical(query: string, numbers: number[]): string | null {
-  if (numbers.length === 0) return null;
-  const q = query.toLowerCase();
-
-  if (/\b(average|mean)\b/.test(q)) {
-    const avg = numbers.reduce((a, b) => a + b, 0) / numbers.length;
-    return `The computed average is ${avg.toFixed(2)} (from ${numbers.length} values: ${numbers.join(', ')}).`;
-  }
-  if (/\b(sum|total)\b/.test(q)) {
-    return `The total is ${numbers.reduce((a, b) => a + b, 0).toFixed(2)}.`;
-  }
-  if (/\b(count|how many)\b/.test(q)) {
-    return `Count: ${numbers.length}.`;
-  }
-  if (/\b(max|maximum|highest|fastest)\b/.test(q)) {
-    return `The maximum value is ${Math.max(...numbers)}.`;
-  }
-  if (/\b(min|minimum|lowest|slowest)\b/.test(q)) {
-    return `The minimum value is ${Math.min(...numbers)}.`;
-  }
-  return null;
-}
-
-function compressChunks(chunks: string[], maxTokens: number, excludeEntities: Set<string>): string {
-  if (chunks.length === 0) return '';
-  const compressed: string[] = [];
-  let total = 0;
-
-  for (let i = 0; i < chunks.length && i < 8; i++) {
-    let chunk = chunks[i];
-
-    // Deprioritize chunks primarily about excluded entities
-    if (excludeEntities.size > 0) {
-      const lower = chunk.toLowerCase();
-      const excluded = [...excludeEntities].some(e => {
-        const re = new RegExp(`\\b${e.toLowerCase()}\\b`, 'g');
-        return (lower.match(re) || []).length > 2;
-      });
-      if (excluded) continue;
-    }
-
-    // Light cleanup only — do NOT strip sentences or discourse markers.
-    // Stripping sentences causes the model to miss answers that use
-    // different phrasing than the query (paraphrase/synonym recall failure).
-    chunk = chunk.replace(/\s{2,}/g, ' ').trim();
-
-    const tk = countTk(chunk);
-    if (total + tk > maxTokens) {
-      const rem = maxTokens - total;
-      if (rem > 30) compressed.push(`[${compressed.length + 1}] ${truncTk(chunk, rem)}`);
-      break;
-    }
-    compressed.push(`[${compressed.length + 1}] ${chunk}`);
-    total += tk;
-  }
-  return compressed.join('\n\n');
-}
 
 // --- Summary Management
 
@@ -1301,9 +908,6 @@ const CHAT_SYSTEM = `You are Epito, an AI assistant that answers questions about
 5. Be specific — cite names, dates, and facts from the notes`;
 
 const CHAT_GROUNDING = `Answer using only the notes provided. Be specific and explain relationships between entities.`;
-
-// --- Summary System Prompt (synthesis focused)
-const SUMMARY_SYSTEM = `You are a world-class analyst. Produce comprehensive, insightful summaries that explain the meaning and significance of the content.`;
 
 // Intent-specific prompt additions (one-liner per intent, appended to user query)
 const INTENT_PROMPTS: Record<ChatIntent, string> = {
@@ -1398,51 +1002,6 @@ function groundingCheck(response: string, context: string): string[] {
   return ungrounded;
 }
 
-function detectLoop(text: string): boolean {
-  const words = text.toLowerCase().split(/\s+/);
-  if (words.length < 24) return false;
-  const ngrams = new Map<string, number>();
-  for (let i = 0; i <= words.length - 8; i++) {
-    const g = words.slice(i, i + 8).join(' ');
-    ngrams.set(g, (ngrams.get(g) || 0) + 1);
-    if ((ngrams.get(g) || 0) >= 3) return true;
-  }
-  return false;
-}
-
-function validateOutput(text: string, query: string, context: string): 'ok' | 'empty' | 'repetition' | 'off-topic' | 'excluded-entity' {
-  if (!text || text.trim().length < 5) return 'empty';
-  if (detectLoop(text)) return 'repetition';
-
-  const sentences = text.split(/[.!?]+/).map(s => s.trim().toLowerCase()).filter(s => s.length > 15);
-  const seen = new Set<string>();
-  for (const s of sentences) { if (seen.has(s)) return 'repetition'; seen.add(s); }
-
-  // Check excluded entity violation
-  for (const entity of excludedEntities) {
-    if (text.toLowerCase().includes(entity.toLowerCase()) && !query.toLowerCase().includes(entity.toLowerCase())) {
-      return 'excluded-entity';
-    }
-  }
-
-  // Check similarity to recent responses (entity fixation detection)
-  for (const prev of recentResponses.slice(-3)) {
-    const prevWords = new Set(prev.toLowerCase().split(/\s+/).filter(w => w.length > 4));
-    const curWords = text.toLowerCase().split(/\s+/).filter(w => w.length > 4);
-    const overlap = curWords.filter(w => prevWords.has(w));
-    if (overlap.length > curWords.length * 0.7 && curWords.length > 10) return 'repetition';
-  }
-
-  if (query && context) {
-    const qw = new Set(query.toLowerCase().split(/\s+/).filter(w => w.length > 4));
-    const cw = new Set(context.toLowerCase().split(/\s+/).filter(w => w.length > 4).slice(0, 100));
-    const rw = text.toLowerCase().split(/\s+/).filter(w => w.length > 4);
-    if (rw.filter(w => qw.has(w) || cw.has(w)).length === 0 && rw.length > 10) return 'off-topic';
-  }
-
-  return 'ok';
-}
-
 // --- Core Pipeline
 
 function getParams(frustrated: boolean, isCorrection: boolean, intent: ChatIntent) {
@@ -1452,268 +1011,8 @@ function getParams(frustrated: boolean, isCorrection: boolean, intent: ChatInten
   return { temperature: 0.7, repeat_penalty: 1.1, presence_penalty: 0.0, top_p: 0.9, top_k: 50, max_tokens: maxTk };
 }
 
-async function chatPipeline(
-  rawContext: string,
-  rawQuery: string,
-  history: ChatMessage[],
-  isRAG: boolean,
-  chunks?: string[],
-): Promise<string> {
-  await ensureLlamaRunning();
-  await acquireInferenceLock();
-  holdServer();
-  const start = Date.now();
-
-  try {
-    chatTurns++;
-
-    // Step 0: Distress detection (BEFORE everything, no model call, no retrieval)
-    if (detectDistress(rawQuery)) {
-      console.log('[Chat] DISTRESS detected — returning crisis response');
-      return DISTRESS_RESPONSE;
-    }
-
-    const lastResponse = history.length > 0 ? history[history.length - 1]?.content || '' : '';
-
-    // Step 1: Frustration detection
-    const frustrated = detectFrustration(rawQuery);
-    if (frustrated) console.log('[Chat] Frustration detected');
-
-    // Step 2: Correction detection
-    const { isCorrection, assertion } = detectCorrection(rawQuery, lastResponse);
-    if (isCorrection) console.log(`[Chat] Correction detected: "${assertion}"`);
-
-    // Step 3: Intent classification
-    const intent = classifyIntent(rawQuery, isCorrection);
-    console.log(`[Chat] Intent: ${intent}`);
-
-    // Handle entity exclusion
-    const forgetMatch = rawQuery.match(/\b(?:forget|stop talking about|ignore)\s+(.+)/i);
-    if (forgetMatch) {
-      excludedEntities.add(forgetMatch[1].trim());
-      console.log(`[Chat] Excluded entity: "${forgetMatch[1].trim()}"`);
-    }
-
-    // KV cache reset
-    if (chatTurns % KV_RESET_INTERVAL === 0) {
-      console.log(`[Chat] KV cache reset at turn ${chatTurns}`);
-      try { await fetch(`${LLAMA_URL}/slots/0?action=erase`, { method: 'POST', signal: AbortSignal.timeout(2000) }); } catch {}
-      cachedSummary = '';
-      cachedSummaryLen = 0;
-    }
-
-    // Step 4: Query rewriting
-    const { summary, recent } = await manageSummary(history, intent, frustrated);
-    let rewritten = await rewriteQuery(rawQuery, recent);
-    if (isCorrection && assertion) rewritten += ` (Correction: ${assertion})`;
-
-    // Step 5: Context preparation
-    let context: string;
-    if (isRAG && chunks) {
-      context = compressChunks(chunks, TOKEN_BUDGET.context, excludedEntities);
-    } else {
-      context = truncTk(rawContext, TOKEN_BUDGET.context);
-    }
-
-    // Focused context extraction: find query terms in chunks
-    const allChunks = isRAG && chunks ? chunks : context ? [context] : [];
-    const extraction = extractFocusedContext(rawQuery, allChunks);
-
-    // Use focused context if term matches found, otherwise full context
-    let effectiveContext = extraction.matchCount > 0
-      ? extraction.focusedContext
-      : context;
-
-    // Entity-enriched context: relationship graph header before raw text
-    const entityHeader = buildEntityContext(rawQuery);
-    if (entityHeader) {
-      effectiveContext = `### Entity Relationships\n${entityHeader}\n\n### Note Content\n${effectiveContext}`;
-    }
-
-    // Step 6: Prompt assembly
-    const flags = { frustrated, isCorrection, intent };
-    const messages = buildMessages(effectiveContext, summary, recent, rewritten, flags);
-
-    // Step 7: Generation
-    const params = getParams(frustrated, isCorrection, intent);
-    const body = { messages, ...params, stream: false };
-
-    const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`LLM error: ${res.status}`);
-    const data = await res.json();
-    let response = (data.choices?.[0]?.message?.content || '').trim();
-
-    // Step 8: Output validation
-    const validation = validateOutput(response, rewritten, context);
-    if (validation !== 'ok') {
-      console.warn(`[Chat] Validation: ${validation}. Retrying...`);
-      const retryBody = { ...body, temperature: Math.min(params.temperature + 0.15, 0.5), repeat_penalty: 1.25 };
-      if (validation === 'repetition' || validation === 'excluded-entity') {
-        // Wipe summary to break fixation
-        retryBody.messages = buildMessages(context, '', recent, rewritten, { ...flags, frustrated: true });
-      }
-      const rr = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(retryBody),
-      });
-      if (rr.ok) {
-        const rd = await rr.json();
-        const rsp = (rd.choices?.[0]?.message?.content || '').trim();
-        response = validateOutput(rsp, rewritten, context) === 'ok' ? rsp : FALLBACK;
-      } else {
-        response = FALLBACK;
-      }
-    }
-
-    // Grounding check: flag ungrounded entities/numbers
-    const ungrounded = groundingCheck(response, context);
-    if (ungrounded.length > 2) {
-      console.warn(`[Chat] Grounding: ${ungrounded.length} ungrounded claims: ${ungrounded.join(', ')}`);
-      // Regenerate with stricter grounding
-      const strictBody = { ...body, temperature: 0.1, max_tokens: params.max_tokens };
-      strictBody.messages = buildMessages(context, '', recent, rewritten, { ...flags, frustrated: true });
-      try {
-        const sr = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(strictBody),
-        });
-        if (sr.ok) {
-          const sd = await sr.json();
-          const strict = (sd.choices?.[0]?.message?.content || '').trim();
-          if (strict && groundingCheck(strict, context).length < ungrounded.length) {
-            response = strict;
-          }
-        }
-      } catch {}
-    } else if (ungrounded.length > 0) {
-      console.log(`[Chat] Minor grounding gaps: ${ungrounded.join(', ')}`);
-    }
-
-    // Track for fixation detection
-    recentResponses.push(response);
-    if (recentResponses.length > 5) recentResponses.shift();
-
-    console.log(`[Chat] ${Date.now() - start}ms | turn=${chatTurns} | intent=${intent} | frustrated=${frustrated} | correction=${isCorrection}`);
-    return response;
-  } finally {
-    recordInferenceTime(Date.now() - start);
-    releaseInferenceLock();
-    releaseServer();
-  }
-}
-
-// --- Streaming Pipeline
-
-async function* streamPipeline(
-  rawContext: string,
-  rawQuery: string,
-  history: ChatMessage[],
-  isRAG: boolean,
-  chunks?: string[],
-): AsyncGenerator<string> {
-  await ensureLlamaRunning();
-  await acquireInferenceLock();
-  holdServer();
-  const start = Date.now();
-
-  try {
-    chatTurns++;
-
-    // Step 0: Distress detection
-    if (detectDistress(rawQuery)) {
-      yield DISTRESS_RESPONSE;
-      return;
-    }
-
-    const lastResponse = history.length > 0 ? history[history.length - 1]?.content || '' : '';
-
-    const frustrated = detectFrustration(rawQuery);
-    const { isCorrection, assertion } = detectCorrection(rawQuery, lastResponse);
-    const intent = classifyIntent(rawQuery, isCorrection);
-
-    const forgetMatch = rawQuery.match(/\b(?:forget|stop talking about|ignore)\s+(.+)/i);
-    if (forgetMatch) excludedEntities.add(forgetMatch[1].trim());
-
-    if (chatTurns % KV_RESET_INTERVAL === 0) {
-      try { await fetch(`${LLAMA_URL}/slots/0?action=erase`, { method: 'POST', signal: AbortSignal.timeout(2000) }); } catch {}
-      cachedSummary = ''; cachedSummaryLen = 0;
-    }
-
-    const { summary, recent } = await manageSummary(history, intent, frustrated);
-    let rewritten = await rewriteQuery(rawQuery, recent);
-    if (isCorrection && assertion) rewritten += ` (Correction: ${assertion})`;
-
-    let context = isRAG && chunks ? compressChunks(chunks, TOKEN_BUDGET.context, excludedEntities) : truncTk(rawContext, TOKEN_BUDGET.context);
-
-    // Focused context extraction — narrows context for model, never bypasses it
-    const allChunksS = isRAG && chunks ? chunks : context ? [context] : [];
-    const extractionS = extractFocusedContext(rawQuery, allChunksS);
-
-    if (extractionS.matchCount > 0) {
-      context = extractionS.focusedContext;
-    }
-
-    // Entity-enriched context (same as sync pipeline)
-    const entityHeaderS = buildEntityContext(rawQuery);
-    if (entityHeaderS) {
-      context = `### Entity Relationships\n${entityHeaderS}\n\n### Note Content\n${context}`;
-    }
-
-    const flags = { frustrated, isCorrection, intent };
-    const messages = buildMessages(context, summary, recent, rewritten, flags);
-
-    const params = getParams(frustrated, isCorrection, intent);
-    const body = { messages, ...params, stream: true };
-
-    const res = await fetch(`${LLAMA_URL}/v1/chat/completions`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(`LLM error: ${res.status}`);
-
-    const reader = res.body?.getReader();
-    if (!reader) throw new Error('No body');
-    const decoder = new TextDecoder();
-    let accumulated = '', buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t || !t.startsWith('data: ')) continue;
-        const p = t.slice(6);
-        if (p === '[DONE]') continue;
-        try {
-          const d = JSON.parse(p);
-          const c = d.choices?.[0]?.delta?.content;
-          if (c) {
-            accumulated += c;
-            yield accumulated;
-          }
-        } catch {}
-      }
-    }
-
-    recentResponses.push(accumulated);
-    if (recentResponses.length > 5) recentResponses.shift();
-  } finally {
-    recordInferenceTime(Date.now() - start);
-    releaseInferenceLock();
-    releaseServer();
-  }
-}
-
 // --- MSR-RAG Chat Pipeline (Multi-Stage Reasoning Retrieval)
 // Query Understanding -> Retrieval -> Reasoning -> Targeted Retrieval -> Assembly -> Synthesis -> Verification
-
-import { contextualRetrieveForChat, semanticSearch } from '@/inference/pipeline';
 
 // --- Query Understanding (zero LLM)
 // Extracts intent, entities, relationship patterns, question type, and implicit entity types.
@@ -1890,7 +1189,7 @@ function assembleContext(
   stage1: string[],
   stage2: string[],
   queryEntities: string[],
-  questionType: QuestionType,
+  _questionType: QuestionType,
   maxTokens: number,
 ): string {
   const all = [...stage1, ...stage2];
@@ -2225,7 +1524,6 @@ export async function msrChat(
   return result;
 }
 
-
 function estimateTokens(text: string): number {
   return Math.ceil(text.split(/\s+/).length * 1.33);
 }
@@ -2273,69 +1571,3 @@ export function chunkForSummarization(text: string): string[] {
 
   return chunks;
 }
-
-const SECTION_SUMMARY_PROMPT = (sectionText: string, index: number, total: number, previousPoints: string) => {
-  let prompt = `You are analyzing section ${index + 1} of ${total} from a document.\n\n`;
-
-  if (previousPoints) {
-    prompt += `PREVIOUSLY COVERED POINTS (DO NOT REPEAT ANY OF THESE):\n${previousPoints}\n\n`;
-  }
-
-  prompt += `Analyze ONLY this section and extract NEW insights not already covered above.
-
-STRICT LIMIT: Your ENTIRE response must be under 150 words.
-
-Output using EXACTLY these section headers where applicable:
-
-KEY IDEAS
-- [insight]
-
-IMPORTANT DETAILS
-- [detail]
-
-CONCEPTS
-- [concept or term worth noting]
-
-Rules:
-- Keep total response under 150 words
-- Skip any point already covered in previous sections
-- Extract insights — do not paraphrase or copy the text
-- Each point must be one concise line
-- Only include a header if it has at least one point
-- Do NOT add meta-commentary, introductions, or conclusions
-
-Section text:
-"""
-${sectionText}
-"""`;
-
-  return prompt;
-};
-
-const MERGE_SECTIONS_PROMPT = (allSections: string) =>
-`Combine these section summaries into one final coherent summary.
-
-Rules:
-- Merge overlapping or similar points into single clear statements
-- Remove all redundancy
-- Group under these EXACT headers: KEY IDEAS, IMPORTANT DETAILS, CONCEPTS
-- Order points by importance within each group
-- Keep each point to one concise line
-- Preserve all unique information — do not drop non-redundant points
-
-Section summaries:
-"""
-${allSections}
-"""
-
-Output using EXACTLY these headers:
-
-KEY IDEAS
-- ...
-
-IMPORTANT DETAILS
-- ...
-
-CONCEPTS
-- ...`;
-

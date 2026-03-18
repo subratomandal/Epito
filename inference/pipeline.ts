@@ -3,7 +3,7 @@ import * as db from '@/notes/database';
 import { generateEmbedding, initEmbeddings, EMBEDDING_DIM } from '@/memory/embeddings';
 import { VectorIndex, cosineSimilarity } from '@/memory/vector';
 import { cleanInputText } from '@/model/llm';
-import type { Note, SearchResult, RelatedNote, Topic, AISummary, SourceType, ContextualMatch, ChatRetrievalResult } from '@/common/types';
+import type { Note, SearchResult, RelatedNote, AISummary, SourceType, ContextualMatch, ChatRetrievalResult } from '@/common/types';
 import { stripHtml } from '@/common/utils';
 
 const chunkIndex = new VectorIndex(EMBEDDING_DIM);
@@ -54,8 +54,6 @@ interface StructuredBlock {
 
 function extractStructuredBlocks(text: string): StructuredBlock[] {
   const blocks: StructuredBlock[] = [];
-  let remaining = text;
-  let offset = 0;
 
   // Regex for fenced code blocks (```...```)
   const codeBlockRe = /```[\s\S]*?```/g;

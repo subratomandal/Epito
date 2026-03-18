@@ -1,4 +1,5 @@
 import { closeDb } from '@/notes/database';
+import { closeBrowser } from '@/inference/browser';
 
 let shutdownStarted = false;
 
@@ -28,9 +29,9 @@ function performShutdown(signal: string): void {
   console.log(`[Lifecycle] Node.js shutdown initiated (${signal})`);
 
   try {
-    console.log('[Lifecycle] Closing database...');
+    closeBrowser().catch(() => {});
     closeDb();
-    console.log('[Lifecycle] Database closed.');
+    console.log('[Lifecycle] Database and browser closed.');
   } catch (err) {
     console.error('[Lifecycle] Error during shutdown:', err);
   }

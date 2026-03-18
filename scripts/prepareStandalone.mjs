@@ -46,6 +46,7 @@ const NATIVE_MODULES = [
   'onnxruntime-node',
   'pdf-parse',
   'mammoth',
+  'puppeteer-core',
 ];
 
 console.log('[prepare] Copying native modules...');

@@ -88,7 +88,7 @@ function renderHighlightedParagraph(
   return <>{parts}</>;
 }
 
-export default function DocumentViewer({ type, id, onClose, isMobile, onTextChange }: DocumentViewerProps) {
+export default function DocumentViewer({ type, id, onClose: _onClose, isMobile, onTextChange: _onTextChange }: DocumentViewerProps) {
   const [data, setData] = useState<ViewerData | null>(null);
   const [loading, setLoading] = useState(true);
   const [imageModal, setImageModal] = useState(false);
