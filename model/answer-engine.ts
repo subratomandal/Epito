@@ -1,16 +1,7 @@
-/**
- * Answer Engine — dynamic context extraction layer.
- *
- * Instead of hardcoded entity patterns, this:
- *   1. Extracts key terms from the user's query
- *   2. Finds every occurrence of those terms in the chunks
- *   3. Reads 100 words before and after each match
- *   4. Deduplicates overlapping excerpts
- *   5. Returns these focused excerpts as the prompt context
- *
- * The model gets ONLY the relevant surrounding text, not entire chunks.
- * Less noise = the model actually reads it.
- */
+// --- Answer Engine
+// Extracts key terms from a query, finds occurrences in note chunks,
+// and returns focused 200-word excerpts around each match as LLM context.
+// Less noise than full chunks = better model accuracy.
 
 const STOP_WORDS = new Set([
   'the', 'a', 'an', 'is', 'are', 'was', 'were', 'what', 'which', 'who',
@@ -27,9 +18,9 @@ const STOP_WORDS = new Set([
   'what', 'name', 'names', 'please', 'paper', 'note', 'notes',
 ]);
 
-// ─── Extract Key Terms from Query ────────────────────────────────────────────
+// --- Term Extraction
 
-/** Simple suffix stemmer — "universities" → "university", "mentioned" → "mention" */
+// Simple suffix stemmer: "universities" -> "university", "mentioned" -> "mention"
 function simpleStem(word: string): string {
   if (word.endsWith('ies') && word.length > 4) return word.slice(0, -3) + 'y';
   if (word.endsWith('es') && word.length > 4) return word.slice(0, -2);
@@ -46,7 +37,6 @@ function extractQueryTerms(query: string): string[] {
     .split(/\s+/)
     .filter(w => w.length > 2 && !STOP_WORDS.has(w));
 
-  // Add stemmed variants so "universities" matches "university"
   const withStems: string[] = [];
   for (const w of words) {
     withStems.push(w);
@@ -54,7 +44,7 @@ function extractQueryTerms(query: string): string[] {
     if (stemmed !== w && stemmed.length > 2) withStems.push(stemmed);
   }
 
-  // Also extract multi-word phrases (2-3 word ngrams that appear as-is)
+  // Include 2-3 word ngrams for multi-word term matching
   const cleaned = query.toLowerCase().replace(/[^\w\s]/g, ' ');
   const allWords = cleaned.split(/\s+/).filter(w => w.length > 0);
   const phrases: string[] = [];
@@ -70,18 +60,18 @@ function extractQueryTerms(query: string): string[] {
     }
   }
 
-  // Combine: phrases + words + stemmed variants
+  // Longest terms first so phrase matches take priority over single words
   const all = [...new Set([...phrases, ...withStems])];
   all.sort((a, b) => b.length - a.length);
   return all;
 }
 
-// ─── Find Matches + Surrounding Context ──────────────────────────────────────
+// --- Match Extraction
 
 interface ContextMatch {
   term: string;
   position: number;
-  excerpt: string; // 100 words before + match + 100 words after
+  excerpt: string;
 }
 
 function findMatchesWithContext(
@@ -92,7 +82,7 @@ function findMatchesWithContext(
   const textLower = text.toLowerCase();
   const words = text.split(/\s+/);
   const matches: ContextMatch[] = [];
-  const coveredRanges: [number, number][] = []; // prevent overlapping excerpts
+  const coveredRanges: [number, number][] = [];
 
   for (const term of terms) {
     let searchFrom = 0;
@@ -102,11 +92,10 @@ function findMatchesWithContext(
       if (pos === -1) break;
       searchFrom = pos + term.length;
 
-      // Convert character position to word index
       const charsBefore = text.slice(0, pos);
       const wordIdx = charsBefore.split(/\s+/).length - 1;
 
-      // Check if this position overlaps with an already-extracted region
+      // Skip if this region overlaps with an already-extracted excerpt
       const start = Math.max(0, wordIdx - windowWords);
       const end = Math.min(words.length, wordIdx + windowWords);
 
@@ -122,12 +111,9 @@ function findMatchesWithContext(
     }
   }
 
-  // Sort by position in document (preserve reading order)
   matches.sort((a, b) => a.position - b.position);
   return matches;
 }
-
-// ─── Count Occurrences ───────────────────────────────────────────────────────
 
 function countOccurrences(text: string, term: string): number {
   const lower = text.toLowerCase();
@@ -141,16 +127,12 @@ function countOccurrences(text: string, term: string): number {
   return count;
 }
 
-// ─── Main: Extract Focused Context ───────────────────────────────────────────
+// --- Context Extraction
 
 export interface ExtractionResult {
-  /** The focused excerpts to use as context (replaces full chunks) */
   focusedContext: string;
-  /** Number of unique term matches found */
   matchCount: number;
-  /** The terms that were found */
   matchedTerms: string[];
-  /** Whether enough was found to skip the model entirely */
   directAnswer: string | null;
 }
 
@@ -166,7 +148,7 @@ export function extractFocusedContext(
   const terms = extractQueryTerms(query);
 
   if (terms.length === 0) {
-    // No meaningful terms extracted — return first 500 words as context
+    // No meaningful terms; fall back to first 500 words
     const words = combined.split(/\s+/);
     return {
       focusedContext: words.slice(0, 500).join(' '),
@@ -176,14 +158,13 @@ export function extractFocusedContext(
     };
   }
 
-  // Find which terms actually appear in the text
   const foundTerms: string[] = [];
   const termCounts = new Map<string, number>();
 
   for (const term of terms) {
     const count = countOccurrences(combined, term);
     if (count > 0) {
-      // Avoid adding a single word if a phrase containing it is already found
+      // Skip single words already covered by a longer phrase match
       const alreadyCovered = foundTerms.some(
         ft => ft.length > term.length && ft.includes(term)
       );
@@ -198,21 +179,18 @@ export function extractFocusedContext(
     return { focusedContext: '', matchCount: 0, matchedTerms: [], directAnswer: null };
   }
 
-  // Extract context windows around each match
   const matches = findMatchesWithContext(combined, foundTerms, 100);
   const totalMatches = foundTerms.reduce((sum, t) => sum + (termCounts.get(t) || 0), 0);
 
-  // Build focused context from excerpts
   let focusedContext: string;
   if (matches.length === 0) {
-    // Terms exist but no non-overlapping windows (very short text)
+    // Text too short for windowed extraction; use it all
     focusedContext = combined;
   } else {
     focusedContext = matches.map((m, i) => `[${i + 1}] ${m.excerpt}`).join('\n\n');
   }
 
-  // No directAnswer — all queries go through the AI model.
-  // This function only provides focused context to improve model accuracy.
+  // All queries go through the AI model; this only provides focused context
   const directAnswer: string | null = null;
 
   console.log(

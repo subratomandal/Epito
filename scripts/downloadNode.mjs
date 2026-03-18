@@ -1,11 +1,6 @@
 #!/usr/bin/env node
-/**
- * Copies the currently running Node.js binary for Tauri bundling.
- *
- * This uses process.execPath (the exact binary running this script) to guarantee
- * ABI compatibility with native modules (better-sqlite3, sharp, etc.) that were
- * compiled by npm install using the same Node.js.
- */
+// Copies the running Node.js binary into src-tauri/binaries for Tauri bundling.
+// Uses process.execPath to guarantee ABI compatibility with compiled native modules.
 import { existsSync, mkdirSync, chmodSync, statSync, copyFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { execSync } from 'child_process';
@@ -32,7 +27,6 @@ if (!triple) {
 const ext = process.platform === 'win32' ? '.exe' : '';
 const outputPath = join(BIN_DIR, `node-${triple}${ext}`);
 
-// Check if existing binary matches the current Node.js version
 if (existsSync(outputPath)) {
   const size = statSync(outputPath).size;
   if (size > 1_000_000) {
@@ -51,7 +45,6 @@ if (existsSync(outputPath)) {
 
 mkdirSync(BIN_DIR, { recursive: true });
 
-// Copy the exact Node.js binary that's running this script
 const sourceNode = process.execPath;
 console.log(`[bundleNode] Copying system Node.js: ${sourceNode}`);
 console.log(`[bundleNode] Version: ${process.version}, arch: ${process.arch}`);

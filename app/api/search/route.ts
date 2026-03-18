@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { semanticSearch } from '@/lib/ai/pipeline';
-import * as db from '@/lib/database';
-import type { Note } from '@/lib/types';
+import { semanticSearch } from '@/inference/pipeline';
+import * as db from '@/notes/database';
+import type { Note } from '@/common/types';
 
 export const dynamic = 'force-dynamic';
 

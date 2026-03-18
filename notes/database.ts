@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import path from 'path';
 import fs from 'fs';
 import { randomUUID } from 'crypto';
-import type { Note, NoteChunk, Topic, NoteLink, Document, UploadedImage, SourceType } from './types';
+import type { Note, NoteChunk, Topic, NoteLink, Document, UploadedImage, SourceType } from '@/common/types';
 import { encrypt, decrypt } from './encryption';
 
 const DATA_DIR = process.env.EPITO_DATA_DIR || path.resolve(process.cwd(), 'data');
@@ -746,7 +746,7 @@ export function pruneStaleChunkCache(sourceId: string, validCount: number) {
   ).run(sourceId, validCount);
 }
 
-// ─── Entity Index ────────────────────────────────────────────────────────────
+// Entity Index
 
 export function insertEntity(documentId: string, entityName: string, entityType: string, chunkId: string | null, evidence: string) {
   const id = randomUUID();
@@ -769,12 +769,13 @@ export function getEntitiesByDocument(documentId: string, entityType?: string): 
 }
 
 export function searchEntities(query: string, entityType?: string): { entity_name: string; entity_type: string; document_id: string; evidence: string }[] {
-  const pattern = `%${query}%`;
+  const escaped = escapeLike(query);
+  const pattern = `%${escaped}%`;
   if (entityType) {
-    return getDb().prepare("SELECT DISTINCT entity_name, entity_type, document_id, evidence FROM entities WHERE entity_name LIKE ? AND entity_type = ?")
+    return getDb().prepare("SELECT DISTINCT entity_name, entity_type, document_id, evidence FROM entities WHERE entity_name LIKE ? ESCAPE '\\' AND entity_type = ?")
       .all(pattern, entityType) as any[];
   }
-  return getDb().prepare("SELECT DISTINCT entity_name, entity_type, document_id, evidence FROM entities WHERE entity_name LIKE ?")
+  return getDb().prepare("SELECT DISTINCT entity_name, entity_type, document_id, evidence FROM entities WHERE entity_name LIKE ? ESCAPE '\\'")
     .all(pattern) as any[];
 }
 

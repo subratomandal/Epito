@@ -1,4 +1,4 @@
-import { closeDb } from './database';
+import { closeDb } from '@/notes/database';
 
 let shutdownStarted = false;
 

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import * as db from '@/lib/database';
+import * as db from '@/notes/database';
 import { unlink } from 'fs/promises';
 import path from 'path';
 

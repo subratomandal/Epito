@@ -1,20 +1,6 @@
 #!/usr/bin/env node
-/**
- * Downloads the correct llama-server build for the current platform and GPU.
- *
- * GPU & CUDA version selection (matches Ollama/LM Studio/Jan.ai approach):
- *   1. Detect GPU vendor (NVIDIA, AMD, Intel, none)
- *   2. For NVIDIA: detect driver CUDA version via nvidia-smi
- *   3. Select best matching CUDA toolkit build (13.x > 12.x)
- *   4. Fallback chain: CUDA → Vulkan → CPU
- *
- *   macOS          → Metal build (built-in)
- *   Windows NVIDIA → CUDA 12.4 build (if driver supports CUDA 12+), else Vulkan
- *   Windows AMD    → Vulkan build (universal GPU)
- *   Windows Intel  → Vulkan build
- *   Windows no GPU → CPU AVX2 build
- *   Linux          → Ubuntu build
- */
+// Downloads the correct llama-server build for the current platform and GPU.
+// Fallback chain: CUDA 12.4 -> Vulkan -> CPU AVX2. macOS uses Metal, Linux uses Ubuntu build.
 import { existsSync, mkdirSync, chmodSync, createWriteStream, statSync, readdirSync, renameSync, copyFileSync, unlinkSync, rmSync, writeFileSync, readFileSync } from 'fs';
 import { join, resolve } from 'path';
 import { execSync } from 'child_process';
@@ -25,7 +11,6 @@ const BIN_DIR = join(ROOT, 'src-tauri', 'binaries');
 const LLAMA_CPP_VERSION = 'b8340';
 const GITHUB_BASE = `https://github.com/ggerganov/llama.cpp/releases/download/${LLAMA_CPP_VERSION}`;
 
-// Stamp file to track what was installed (version + backend)
 const STAMP_FILE = join(BIN_DIR, '.llama-server-stamp.json');
 
 // ─── GPU Detection ───────────────────────────────────────────────────────────
@@ -38,7 +23,7 @@ function detectGpu() {
     return 'cpu';
   }
 
-  // Windows — try nvidia-smi first (fastest, most reliable for NVIDIA)
+  // Windows GPU detection: nvidia-smi -> PowerShell -> WMIC fallback
   try {
     const out = execSync('nvidia-smi --query-gpu=name --format=csv,noheader', {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000,
@@ -46,7 +31,6 @@ function detectGpu() {
     if (out) { console.log(`[GPU] NVIDIA (nvidia-smi): ${out}`); return 'nvidia'; }
   } catch {}
 
-  // PowerShell (modern Windows 10/11)
   try {
     const out = execSync(
       'powershell -NoProfile -NoLogo -Command "Get-CimInstance -ClassName Win32_VideoController | Select-Object -ExpandProperty Name"',
@@ -60,7 +44,6 @@ function detectGpu() {
     }
   } catch {}
 
-  // WMIC fallback
   try {
     const out = execSync('wmic path win32_VideoController get name', {
       encoding: 'utf8', stdio: 'pipe', timeout: 5000,
@@ -77,15 +60,9 @@ function detectGpu() {
   return 'cpu';
 }
 
-/**
- * Detect the CUDA version supported by the installed NVIDIA driver.
- * This is how Ollama, LM Studio, and vLLM determine which CUDA toolkit to use.
- * The driver advertises the maximum CUDA version it supports.
- * Returns the major version (e.g. 13 or 12), or 0 if unknown.
- */
+// Returns the max CUDA version supported by the NVIDIA driver, or {0, 0} if unknown.
 function detectCudaVersion() {
   try {
-    // nvidia-smi output line: "CUDA Version: 13.2"
     const out = execSync('nvidia-smi', { encoding: 'utf8', stdio: 'pipe', timeout: 5000 });
     const match = out.match(/CUDA Version:\s*(\d+)\.(\d+)/);
     if (match) {
@@ -116,14 +93,8 @@ function getDownloads(platformKey, gpu) {
     if (gpu === 'nvidia') {
       const cuda = detectCudaVersion();
 
-      // CUDA 12.4 requires driver CUDA 12.0+ (driver version ~525+, released late 2022).
-      // For older drivers that only support CUDA 11.x, fall through to Vulkan instead
-      // of downloading CUDA 12.4 DLLs that won't load.
-      //
-      // We always use CUDA 12.4 (never 13.x) because:
-      //   - CUDA 13.x builds have known computation bugs on Ada Lovelace GPUs (RTX 40 series)
-      //   - Ollama, LM Studio, and vLLM also default to CUDA 12.x for maximum compatibility
-      //   - CUDA 12.4 is forward-compatible with any driver advertising CUDA 12.0+
+      // Always use CUDA 12.4: 13.x has known bugs on Ada Lovelace (RTX 40 series),
+      // and 12.4 is forward-compatible with any driver advertising CUDA 12.0+.
       if (cuda.major >= 12) {
         const cudaTag = '12.4';
         console.log(`[GPU] Driver supports CUDA ${cuda.major}.${cuda.minor} → using CUDA 12.4 build (maximum compatibility)`);
@@ -136,7 +107,6 @@ function getDownloads(platformKey, gpu) {
         };
       }
 
-      // Driver too old for CUDA 12.4 — use Vulkan for GPU acceleration
       console.log(`[GPU] Driver CUDA ${cuda.major}.${cuda.minor} too old for CUDA 12.4 → falling back to Vulkan`);
     }
     if (gpu === 'amd' || gpu === 'intel') {
@@ -204,7 +174,7 @@ async function downloadAndExtract(url, desc, tmpDir) {
   mkdirSync(extractDir, { recursive: true });
 
   if (process.platform === 'win32') {
-    // Use PowerShell Expand-Archive — Windows tar misinterprets drive letters (C:) as remote hosts
+    // PowerShell Expand-Archive: Windows tar misinterprets drive letters (C:) as remote hosts
     execSync(`powershell -NoProfile -Command "Expand-Archive -Path '${zipPath}' -DestinationPath '${extractDir}' -Force"`, { stdio: 'pipe', timeout: 120000 });
   } else {
     execSync(`unzip -o "${zipPath}" -d "${extractDir}"`, { stdio: 'pipe' });
@@ -229,7 +199,6 @@ const ext = process.platform === 'win32' ? '.exe' : '';
 const binaryName = `llama-server${ext}`;
 const outputPath = join(BIN_DIR, `llama-server-${triple}${ext}`);
 
-// Check stamp to see if we already have the correct version + backend
 if (existsSync(STAMP_FILE) && existsSync(outputPath) && statSync(outputPath).size > 1000) {
   try {
     const stamp = JSON.parse(readFileSync(STAMP_FILE, 'utf8'));
@@ -245,7 +214,7 @@ mkdirSync(BIN_DIR, { recursive: true });
 
 console.log(`[downloadLlamaServer] Platform: ${platformKey} | GPU: ${gpu} | Downloads: ${downloads.length}`);
 
-// Clean old DLLs before installing new ones (prevents ABI mismatch from mixed versions)
+// Remove old shared libraries to prevent ABI mismatch from mixed versions
 const oldLibs = readdirSync(BIN_DIR).filter(f => f.endsWith(LIB_EXT));
 for (const lib of oldLibs) {
   rmSync(join(BIN_DIR, lib), { force: true });
@@ -257,20 +226,17 @@ try {
   rmSync(tmpDir, { recursive: true, force: true });
   mkdirSync(tmpDir, { recursive: true });
 
-  // Download all archives (main build + optional CUDA runtime)
   const extractDirs = [];
   for (const dl of downloads) {
     const dir = await downloadAndExtract(dl.url, dl.desc, tmpDir);
     extractDirs.push(dir);
   }
 
-  // Find and install llama-server binary (from the first/main archive)
   const foundBinary = findFileRecursive(extractDirs[0], binaryName);
   if (!foundBinary) throw new Error(`${binaryName} not found in archive`);
   moveFile(foundBinary, outputPath);
   console.log(`[downloadLlamaServer] Installed binary: ${outputPath}`);
 
-  // Find and install ALL shared libraries from ALL archives
   let libCount = 0;
   for (const dir of extractDirs) {
     for (const libPath of findAllByExt(dir, LIB_EXT)) {
@@ -282,7 +248,6 @@ try {
     }
   }
 
-  // Set permissions on Unix
   if (process.platform !== 'win32') {
     chmodSync(outputPath, 0o755);
     for (const f of readdirSync(BIN_DIR)) {
@@ -290,16 +255,13 @@ try {
     }
   }
 
-  // Cleanup
   rmSync(tmpDir, { recursive: true, force: true });
 
-  // Validate
   const finalSize = statSync(outputPath).size;
   if (finalSize < 1000) throw new Error(`Binary too small: ${finalSize} bytes`);
 
   const installedLibs = readdirSync(BIN_DIR).filter(f => f.endsWith(LIB_EXT));
 
-  // Write stamp file for future skip logic
   writeFileSync(STAMP_FILE, JSON.stringify({
     version: LLAMA_CPP_VERSION,
     gpu,

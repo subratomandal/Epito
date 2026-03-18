@@ -15,13 +15,8 @@ static SHUTTING_DOWN: AtomicBool = AtomicBool::new(false);
 static NODE_READY: AtomicBool = AtomicBool::new(false);
 static NODE_PORT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
 
-// ─── Windows Job Object ──────────────────────────────────────────────────────
-// Creates a Win32 Job Object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE.
-// When the Epito process exits (even if it crashes), Windows automatically
-// terminates ALL child processes in the job. This is how Chrome, VSCode,
-// and other enterprise apps guarantee zero orphan processes.
-// ─────────────────────────────────────────────────────────────────────────────
-
+// Windows Job Object — guarantees zero orphan processes on exit (even crashes).
+// Chrome pattern: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE auto-kills all children.
 #[cfg(windows)]
 mod win_job {
     use std::sync::OnceLock;
@@ -47,7 +42,6 @@ mod win_job {
         fn CloseHandle(handle: isize) -> i32;
     }
 
-    // JOBOBJECT_BASIC_LIMIT_INFORMATION for x86_64
     #[repr(C)]
     struct BasicLimitInfo {
         per_process_user_time_limit: i64,
@@ -154,9 +148,7 @@ fn wait_for_server(port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Search a directory for a binary by base name.
-/// Checks both plain name ("node.exe") and Tauri sidecar pattern
-/// ("node-x86_64-pc-windows-msvc.exe").
+/// Find a binary by base name, checking both plain and Tauri sidecar naming patterns.
 pub(crate) fn find_binary_in_dir(dir: &std::path::Path, base_name: &str) -> Option<std::path::PathBuf> {
     if !dir.exists() {
         return None;
@@ -293,7 +285,7 @@ pub(crate) fn kill_process_tree(child: &mut Child) {
     let _ = child.wait();
 }
 
-// ─── Window State ────────────────────────────────────────────────────────────
+// -- Window State --
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct WindowState {
@@ -384,7 +376,7 @@ fn validate_position(window: &tauri::WebviewWindow, state: &WindowState) -> (i32
     (state.x, state.y)
 }
 
-// ─── File Dialog ─────────────────────────────────────────────────────────────
+// -- File Dialog --
 
 #[tauri::command]
 async fn save_file_with_dialog(
@@ -408,7 +400,7 @@ async fn save_file_with_dialog(
     }
 }
 
-// ─── Theme ───────────────────────────────────────────────────────────────────
+// -- Theme --
 
 #[tauri::command]
 fn set_theme_color(app: tauri::AppHandle, theme: String) {
@@ -423,9 +415,7 @@ fn set_theme_color(app: tauri::AppHandle, theme: String) {
         let result = window.set_background_color(Some(color));
         log::info!("[Theme] set_background_color({}) = {:?}", theme, result);
 
-        // Windows: Set title bar, border, and caption button colors via DWM API.
-        // Without this, the Windows title bar stays at the system default color
-        // regardless of the app's dark/light mode setting.
+        // Windows: DWM title bar must match app theme explicitly
         #[cfg(windows)]
         {
             if let Ok(hwnd) = window.hwnd() {
@@ -435,14 +425,13 @@ fn set_theme_color(app: tauri::AppHandle, theme: String) {
         }
     }
 
-    // Save for next launch splash
     let path = theme_file_path();
     if let Some(parent) = path.parent() { std::fs::create_dir_all(parent).ok(); }
     std::fs::write(&path, &theme).ok();
     log::info!("[Theme] Set to: {}", theme);
 }
 
-// ─── Shutdown ────────────────────────────────────────────────────────────────
+// -- Shutdown --
 
 fn perform_shutdown(app_handle: &tauri::AppHandle) {
     if SHUTTING_DOWN.swap(true, Ordering::SeqCst) { return; }
@@ -453,7 +442,6 @@ fn perform_shutdown(app_handle: &tauri::AppHandle) {
         save_current_window_state(&window);
     }
 
-    // Graceful llama-server unload
     let llama_state = app_handle.state::<llama_server::LlamaProcess>();
     let llama_port = llama_server::get_port(&llama_state);
     if llama_port > 0 {
@@ -462,7 +450,7 @@ fn perform_shutdown(app_handle: &tauri::AppHandle) {
             .timeout(Duration::from_secs(2)).send();
     }
 
-    // Graceful Node.js shutdown (closes SQLite)
+    // Graceful Node.js shutdown — closes SQLite connections
     let np = NODE_PORT.load(Ordering::Relaxed);
     if np > 0 {
         let _ = reqwest::blocking::Client::new()
@@ -471,7 +459,6 @@ fn perform_shutdown(app_handle: &tauri::AppHandle) {
         thread::sleep(Duration::from_millis(500));
     }
 
-    // Force-kill Node.js
     let server_state = app_handle.state::<ServerProcess>();
     if let Ok(mut guard) = server_state.0.lock() {
         if let Some(ref mut child) = *guard {
@@ -481,11 +468,9 @@ fn perform_shutdown(app_handle: &tauri::AppHandle) {
         *guard = None;
     }
 
-    // Force-kill llama-server
     llama_server::stop(&llama_state);
 
-    // Final sweep: kill ANY orphaned processes by all known names.
-    // This catches processes that escaped PID-based killing.
+    // Catch processes that escaped PID-based killing
     sweep_orphan_processes();
 
     log::info!("[Lifecycle] === SHUTDOWN COMPLETE ===");
@@ -501,7 +486,6 @@ fn sweep_orphan_processes() {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
-        // Kill by ALL possible process names (exact name AND sidecar name)
         for name in &[
             "llama-server.exe",
             "llama-server-x86_64-pc-windows-msvc.exe",
@@ -552,15 +536,14 @@ fn ctrlc_handler<F: FnOnce() + Send + 'static>(handler: F) -> Result<(), String>
     }).map_err(|e| format!("{}", e))
 }
 
-// ─── Splash Screen ───────────────────────────────────────────────────────
+// -- Splash Screen --
 
 fn show_splash(window: &tauri::WebviewWindow) {
     let theme = read_saved_theme();
     let is_dark = theme != "light";
     log::info!("[Lifecycle] Splash theme: {}", if is_dark { "dark" } else { "light" });
 
-    // Set WebView2 background color BEFORE any navigation.
-    // This is the color shown between page loads (prevents white flash).
+    // Prevents white flash between page loads
     let bg_color = if is_dark {
         tauri::webview::Color(10, 10, 15, 255)
     } else {
@@ -568,8 +551,7 @@ fn show_splash(window: &tauri::WebviewWindow) {
     };
     let _ = window.set_background_color(Some(bg_color));
 
-    // Windows: Set title bar color via DWM API.
-    // Must happen BEFORE window.show() so the user never sees a mismatched title bar.
+    // Must happen before window.show() to avoid mismatched title bar flash
     #[cfg(windows)]
     {
         if let Ok(hwnd) = window.hwnd() {
@@ -579,10 +561,7 @@ fn show_splash(window: &tauri::WebviewWindow) {
 
     let bg = if is_dark { "%230a0a0f" } else { "%23ffffff" };
 
-    // Solid colored background — identical to macOS splash.
-    // The animated "Epito" splash (dots → E → pito → fade) is handled by
-    // the React BrandedSplash component, which runs identically on both platforms.
-    // No text here — avoids the jarring static→animated double-appearance.
+    // Solid background only — animated splash is handled by React BrandedSplash
     let splash = format!(
         "data:text/html;charset=utf-8,<!DOCTYPE html><html><head><style>\
 *{{margin:0;padding:0;box-sizing:border-box}}\
@@ -592,15 +571,12 @@ html,body{{margin:0;width:100%25;height:100%25;background:{bg};overflow:hidden}}
     );
     let _ = window.navigate(splash.parse().unwrap());
 
-    // Ensure the window is centered on the primary monitor.
-    // The config has "center: true" but restore_window_state may override it
-    // with a saved position. For first launch, re-center explicitly.
+    // First launch: re-center since restore_window_state may have been skipped
     if load_window_state().is_none() {
         let _ = window.center();
     }
 
-    // Wait for the splash to render before showing the window.
-    // Windows WebView2 needs slightly more time than macOS WKWebView.
+    // WebView2 needs more render time than WKWebView
     #[cfg(windows)]
     thread::sleep(Duration::from_millis(400));
     #[cfg(not(windows))]
@@ -608,29 +584,23 @@ html,body{{margin:0;width:100%25;height:100%25;background:{bg};overflow:hidden}}
     let _ = window.show();
 }
 
-// ─── App Entry ───────────────────────────────────────────────────────────────
+// -- App Entry --
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Single-instance check — prevent multiple Epito processes from running.
-    // Must happen before ANY resource allocation (ports, Job Objects, windows).
-    // Uses a global named mutex; shows a native MessageBox if already running.
+    // Must happen before any resource allocation (ports, Job Objects, windows)
     #[cfg(windows)]
     if !native_win::check_single_instance() {
         std::process::exit(0);
     }
 
-    // Windows: Set Per-Monitor DPI Awareness V2 BEFORE any window creation.
-    // Guarantees crisp, sharp rendering at all display scaling levels (100-200%).
-    // Must be the first Win32 call — cannot be changed after a window exists.
+    // Must be set before any window creation — cannot be changed after
     #[cfg(windows)]
     native_win::ensure_dpi_awareness();
 
     let node_port = find_free_port();
     NODE_PORT.store(node_port, Ordering::Relaxed);
 
-    // Windows: Create Job Object BEFORE spawning any children.
-    // All children assigned to this job auto-terminate when Epito exits.
     #[cfg(windows)]
     win_job::init();
 
@@ -663,11 +633,8 @@ pub fn run() {
                 show_splash(&window);
             }
 
-            // Windows: Log system diagnostics AFTER splash is visible.
-            // nvidia-smi takes 200-800ms — doing it before show_splash
-            // blocked the window from appearing, causing visible startup lag.
-            // The OnceLock in query_gpu_vram() caches the result for later use
-            // by llama-server, so this also serves as a warm-up.
+            // After splash — nvidia-smi takes 200-800ms and would delay window appearance.
+            // Also warms up the OnceLock VRAM cache for later llama-server use.
             #[cfg(windows)]
             {
                 thread::spawn(|| {
@@ -678,7 +645,6 @@ pub fn run() {
             if cfg!(debug_assertions) {
                 let window = app.get_webview_window("main").unwrap();
 
-                // Apply theme in dev mode too
                 let theme = read_saved_theme();
                 let is_dark = theme != "light";
                 let bg = if is_dark {
@@ -697,16 +663,61 @@ pub fn run() {
                 window.navigate("http://127.0.0.1:3000".parse().unwrap())?;
                 let _ = window.show();
                 NODE_READY.store(true, Ordering::Release);
-                let handle = app.handle().clone();
+
+                // Port 8080: Node.js default when LLAMA_SERVER_PORT is unset
+                let dev_llama_port: u16 = 8080;
+                {
+                    let llama_state = app.state::<llama_server::LlamaProcess>();
+                    *llama_state.port.lock().unwrap() = dev_llama_port;
+                }
+
+                if model::model_exists() {
+                    log::info!("[Lifecycle] Dev mode — llama-server will start on-demand (port {})", dev_llama_port);
+                } else {
+                    log::info!("[Lifecycle] Dev mode — no model, will start after download");
+                }
+
+                let handle_dev_llama = app.handle().clone();
                 thread::spawn(move || {
-                    let llama_state = handle.state::<llama_server::LlamaProcess>();
-                    if model::model_exists() {
-                        let port = portpicker::pick_unused_port().unwrap_or(8080);
-                        if let Ok(p) = llama_server::start(&handle, &llama_state, port) {
-                            llama_server::wait_ready(p, Duration::from_secs(120));
+                    let idle_data_dir = model::data_dir();
+                    std::fs::create_dir_all(&idle_data_dir).ok();
+                    let stop_signal = idle_data_dir.join(".idle-stop");
+                    let start_signal = idle_data_dir.join(".idle-start");
+
+                    let _ = std::fs::remove_file(&stop_signal);
+                    let _ = std::fs::remove_file(&start_signal);
+
+                    loop {
+                        if SHUTTING_DOWN.load(Ordering::Relaxed) { break; }
+                        thread::sleep(Duration::from_millis(200));
+
+                        if stop_signal.exists() {
+                            let _ = std::fs::remove_file(&stop_signal);
+                            let llama_state = handle_dev_llama.state::<llama_server::LlamaProcess>();
+                            if llama_server::is_running(&llama_state) {
+                                log::info!("[Dev] Killing llama-server (idle signal)");
+                                llama_server::stop(&llama_state);
+                            }
+                        }
+
+                        if start_signal.exists() {
+                            let _ = std::fs::remove_file(&start_signal);
+                            let llama_state = handle_dev_llama.state::<llama_server::LlamaProcess>();
+                            if !llama_server::is_running(&llama_state) && model::model_exists() {
+                                log::info!("[Dev] Starting llama-server on-demand (port {})", dev_llama_port);
+                                match llama_server::start(&handle_dev_llama, &llama_state, dev_llama_port) {
+                                    Ok(port) => {
+                                        if llama_server::wait_ready(port, Duration::from_secs(120)) {
+                                            log::info!("[Dev] llama-server ready on port {}", port);
+                                        }
+                                    }
+                                    Err(e) => log::warn!("[Dev] llama-server start failed: {}", e),
+                                }
+                            }
                         }
                     }
                 });
+
                 return Ok(());
             }
 
@@ -774,7 +785,6 @@ pub fn run() {
 
                 match cmd.spawn() {
                     Ok(mut child) => {
-                        // Assign to Job Object — auto-kills when Epito exits
                         #[cfg(windows)]
                         win_job::assign(&child);
 
@@ -800,8 +810,7 @@ pub fn run() {
                             let theme = read_saved_theme();
                             let is_dark = theme != "light";
 
-                            // Set WebView2 background color before navigation to prevent
-                            // white flash between splash and app content.
+                            // Prevent white flash between splash and app content
                             let bg = if is_dark {
                                 tauri::webview::Color(10, 10, 15, 255)
                             } else {
@@ -811,8 +820,7 @@ pub fn run() {
 
                             let _ = window.navigate(url.parse().unwrap());
 
-                            // Windows: Reapply DWM title bar theme after navigation.
-                            // WebView2 navigation can sometimes reset the window's visual state.
+                            // WebView2 navigation can reset window visual state
                             #[cfg(windows)]
                             {
                                 if let Ok(hwnd) = window.hwnd() {
@@ -820,66 +828,35 @@ pub fn run() {
                                 }
                             }
 
-                            // Set localStorage + html class so the app picks up the right theme
                             let js = format!(
                                 "localStorage.setItem('theme','{}');document.documentElement.classList.remove('light','dark');document.documentElement.classList.add('{}');",
                                 theme, theme
                             );
-                            // Small delay to let the page start loading
                             thread::sleep(Duration::from_millis(500));
                             let _ = window.eval(&js);
                         }
-                        // Signal that the UI is loaded — llama-server can start now
-                        // without competing with Node.js for disk I/O
                         NODE_READY.store(true, Ordering::Release);
                     }
                     Err(e) => log::error!("[Lifecycle] Node.js spawn failed: {}", e),
                 }
             });
 
-            // ── Runtime Controller (ChatGPT-style ephemeral worker model) ──
-            // llama-server auto-starts on boot for fast first interaction,
-            // then gets killed after 30s idle to reclaim memory. Restarts
-            // on-demand via .idle-start signal when next AI request arrives.
-            //
-            // Memory lifecycle:
-            //   Boot → spawn worker → mmap model → allocate tensors → ready
-            //   → run inference → return tokens → 10s idle → clear KV cache
-            //   → 30s idle → kill worker → idle (0 MB)
-            //   → .idle-start → respawn worker → ready
-            //
-            // Signal files (written by Node.js, consumed by this watcher):
-            //   .idle-start    → spawn llama-server (after idle kill)
-            //   .idle-stop     → kill llama-server (Tier 2: full memory reclaim)
-            //   .idle-kv-clear → clear KV cache via API (Tier 1: ~200MB freed)
+            // Runtime controller: manages llama-server lifecycle via signal files.
+            // .idle-start → spawn, .idle-stop → kill, .idle-kv-clear → clear KV cache.
             let handle_llama = app.handle().clone();
             thread::spawn(move || {
-                // Wait for Node.js before starting — prevents disk I/O contention
-                // that causes the UI to feel sluggish during initial load.
+                // Prevents disk I/O contention that makes UI sluggish during initial load
                 while !NODE_READY.load(Ordering::Acquire) {
                     if SHUTTING_DOWN.load(Ordering::Relaxed) { return; }
                     thread::sleep(Duration::from_millis(100));
                 }
 
-                // Auto-start llama-server on boot (if model exists)
-                // This ensures the UI shows "AI ready" quickly.
-                // The two-tier idle system reclaims memory after 30s of no AI use.
+                // On-demand: saves ~4.5GB until the user actually needs AI
                 if model::model_exists() {
-                    log::info!("[Lifecycle] Node.js ready — starting llama-server");
-                    let llama_state = handle_llama.state::<llama_server::LlamaProcess>();
-                    match llama_server::start(&handle_llama, &llama_state, llama_port) {
-                        Ok(port) => {
-                            if !llama_server::wait_ready(port, Duration::from_secs(120)) {
-                                log::error!("[Lifecycle] llama-server timeout (120s)");
-                            }
-                        }
-                        Err(e) => log::warn!("[Lifecycle] llama-server: {}", e),
-                    }
+                    log::info!("[Lifecycle] Model found — llama-server will start on-demand");
                 } else {
-                    log::info!("[Lifecycle] No model — will start on demand after download");
+                    log::info!("[Lifecycle] No model — will start after download");
                 }
-
-                log::info!("[Lifecycle] Runtime controller started (two-tier idle reclaim)");
 
                 let idle_data_dir = model::data_dir();
                 std::fs::create_dir_all(&idle_data_dir).ok();
@@ -887,18 +864,15 @@ pub fn run() {
                 let start_signal = idle_data_dir.join(".idle-start");
                 let kv_clear_signal = idle_data_dir.join(".idle-kv-clear");
 
-                // Clean stale signals from previous run
                 let _ = std::fs::remove_file(&stop_signal);
                 let _ = std::fs::remove_file(&start_signal);
                 let _ = std::fs::remove_file(&kv_clear_signal);
 
                 loop {
                     if SHUTTING_DOWN.load(Ordering::Relaxed) { break; }
-                    thread::sleep(Duration::from_secs(1));
+                    thread::sleep(Duration::from_millis(200));
 
-                    // ── Tier 2: Full process kill (30s idle) ──
-                    // Releases ALL memory: model weights + KV cache + GPU VRAM.
-                    // OS reclaims everything when the process exits.
+                    // Tier 2: full process kill — releases all memory
                     if stop_signal.exists() {
                         let _ = std::fs::remove_file(&stop_signal);
                         let llama_state = handle_llama.state::<llama_server::LlamaProcess>();
@@ -908,9 +882,7 @@ pub fn run() {
                         }
                     }
 
-                    // ── Tier 1: KV cache clear (10s idle) ──
-                    // Frees ~200MB of attention cache. Model weights stay mapped.
-                    // Process stays alive for fast restart on next request.
+                    // Tier 1: KV cache clear — frees ~200MB, process stays alive
                     if kv_clear_signal.exists() {
                         let _ = std::fs::remove_file(&kv_clear_signal);
                         let llama_state = handle_llama.state::<llama_server::LlamaProcess>();
@@ -926,9 +898,7 @@ pub fn run() {
                         }
                     }
 
-                    // ── On-demand worker spawn ──
-                    // Node.js writes .idle-start when ensureLlamaRunning() detects
-                    // the server is down. This spawns a new worker process.
+                    // On-demand spawn: triggered by Node.js ensureLlamaRunning()
                     if start_signal.exists() {
                         let _ = std::fs::remove_file(&start_signal);
                         let llama_state = handle_llama.state::<llama_server::LlamaProcess>();
@@ -961,7 +931,6 @@ pub fn run() {
                     label, event: tauri::WindowEvent::CloseRequested { .. }, ..
                 } => {
                     if label == "main" {
-                        // Hide window immediately for clean close (no visual glitches)
                         if let Some(w) = app_handle.get_webview_window("main") {
                             let _ = w.hide();
                         }

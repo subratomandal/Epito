@@ -3,8 +3,8 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Dialog, DialogContent, Badge } from '@/components/ui/primitives';
 import { Search, FileText, File, Image as ImageIcon } from 'lucide-react';
-import type { Note, SearchResult } from '@/lib/types';
-import { truncate } from '@/lib/utils';
+import type { Note, SearchResult } from '@/common/types';
+import { truncate } from '@/common/utils';
 
 interface SearchDialogProps {
   open: boolean;

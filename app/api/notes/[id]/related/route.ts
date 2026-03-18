@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { findRelatedNotes } from '@/lib/ai/pipeline';
+import { findRelatedNotes } from '@/inference/pipeline';
 
 export const dynamic = 'force-dynamic';
 

@@ -1,16 +1,8 @@
 #!/usr/bin/env node
-/**
- * Prepares the Next.js standalone build for Tauri bundling.
- *
- * Optimizations (saves ~150-200MB vs naive copy):
- *   - Strips build artifacts from better-sqlite3 (saves ~22MB)
- *   - Removes cross-platform binaries from onnxruntime-node (saves ~60MB)
- *   - Removes duplicate WASM variants from tesseract.js-core (saves ~30MB)
- *   - Copies only current-platform @img/sharp bindings (saves ~15MB)
- *   - Strips .md, .txt, .map, tests, docs from native modules
- */
+// Prepares the Next.js standalone build for Tauri bundling.
+// Strips cross-platform binaries, build artifacts, and junk files (~150-200MB saved).
 import { cpSync, existsSync, mkdirSync, rmSync, readdirSync, statSync } from 'fs';
-import { join, resolve, basename } from 'path';
+import { join, resolve } from 'path';
 
 const ROOT = resolve(import.meta.dirname, '..');
 const STANDALONE = join(ROOT, '.next', 'standalone');
@@ -21,7 +13,6 @@ if (!existsSync(STANDALONE)) {
   process.exit(1);
 }
 
-// Remove stale src-tauri from standalone (Next.js copies the whole project)
 const staleDir = join(STANDALONE, 'src-tauri');
 if (existsSync(staleDir)) {
   rmSync(staleDir, { recursive: true, force: true });
@@ -30,18 +21,16 @@ if (existsSync(staleDir)) {
 
 // ─── Platform detection ──────────────────────────────────────────────────────
 
-const PLATFORM = process.platform;  // 'win32', 'darwin', 'linux'
-const ARCH = process.arch;          // 'x64', 'arm64'
+const PLATFORM = process.platform;
+const ARCH = process.arch;
 
-// onnxruntime-node platform dirs to KEEP (delete all others)
 const ORT_KEEP = `${PLATFORM === 'win32' ? 'win32' : PLATFORM}/${ARCH}`;
 
-// @img/sharp packages to keep (platform-specific)
 const SHARP_PLATFORM = PLATFORM === 'win32' ? 'win32' : PLATFORM === 'darwin' ? 'darwin' : 'linux';
 const SHARP_KEEP_PREFIXES = [
   `sharp-${SHARP_PLATFORM}-${ARCH}`,
   `sharp-libvips-${SHARP_PLATFORM}-${ARCH}`,
-  'colour',  // always needed
+  'colour',
 ];
 
 console.log(`[prepare] Platform: ${PLATFORM}-${ARCH}`);
@@ -80,13 +69,10 @@ for (const mod of NATIVE_MODULES) {
   }
 }
 
-// ─── Strip better-sqlite3 build artifacts (~22MB saved) ──────────────────────
+// ─── Strip better-sqlite3 build artifacts ─────────────────────────────────────
 
 const bsqlDest = join(STANDALONE_MODULES, 'better-sqlite3');
 if (existsSync(bsqlDest)) {
-  // Keep build/Release/better_sqlite3.node (the native binding) but strip
-  // everything else. When installed via node-gyp (no prebuilds/), the binding
-  // lives in build/Release/ and the `bindings` package resolves it from there.
   for (const dir of ['deps', 'src', 'benchmark', 'test']) {
     const target = join(bsqlDest, dir);
     if (existsSync(target)) {
@@ -97,7 +83,7 @@ if (existsSync(bsqlDest)) {
     }
   }
 
-  // Strip build intermediates (.obj, .lib, .pdb, .exp, .iobj, .ipdb) but keep .node
+  // Keep only .node files, strip build intermediates (.obj, .lib, .pdb, etc.)
   const buildRelease = join(bsqlDest, 'build', 'Release');
   if (existsSync(buildRelease)) {
     const KEEP_EXTS = ['.node'];
@@ -118,7 +104,6 @@ if (existsSync(bsqlDest)) {
     console.log('  OK: better-sqlite3 build/Release/*.node preserved');
   }
 
-  // Ensure prebuilds are present (used when installed via prebuild-install)
   const prebuildsSrc = join(ROOT, 'node_modules', 'better-sqlite3', 'prebuilds');
   if (existsSync(prebuildsSrc)) {
     const prebuildsDest = join(bsqlDest, 'prebuilds');
@@ -127,7 +112,7 @@ if (existsSync(bsqlDest)) {
   }
 }
 
-// ─── Strip onnxruntime-node cross-platform binaries (~60MB saved) ────────────
+// ─── Strip onnxruntime-node cross-platform binaries ───────────────────────────
 
 const ortBin = join(STANDALONE_MODULES, 'onnxruntime-node', 'bin', 'napi-v3');
 if (existsSync(ortBin)) {
@@ -147,9 +132,8 @@ if (existsSync(ortBin)) {
   }
 }
 
-// ─── Strip tesseract.js-core duplicate WASM (~30MB saved) ────────────────────
-// Keep only the standard WASM files, remove the .wasm.js (Base64 embedded) duplicates
-// and the non-simd variants (modern CPUs all support SIMD)
+// ─── Strip tesseract.js-core duplicate WASM ──────────────────────────────────
+// Remove .wasm.js (Base64 embedded) duplicates and non-SIMD variants
 
 const tessCore = join(STANDALONE_MODULES, 'tesseract.js-core');
 if (existsSync(tessCore)) {
@@ -161,7 +145,6 @@ if (existsSync(tessCore)) {
     totalSaved += size;
     console.log(`  STRIP: tesseract.js-core/${f} (${mb(size)})`);
   }
-  // Remove non-SIMD variants (all modern x64/arm64 CPUs have SIMD)
   const nonSimd = readdirSync(tessCore).filter(f =>
     f.endsWith('.wasm') && !f.includes('simd') && f.startsWith('tesseract-core')
   );
@@ -195,7 +178,7 @@ if (existsSync(imgDir)) {
   }
 }
 
-// ─── Strip @xenova/transformers nested sharp (uses root sharp instead) ────────
+// ─── Strip @xenova/transformers nested sharp (uses root sharp instead) ─────────
 
 const xenovaSharp = join(STANDALONE_MODULES, '@xenova', 'transformers', 'node_modules', 'sharp');
 if (existsSync(xenovaSharp)) {
@@ -205,7 +188,7 @@ if (existsSync(xenovaSharp)) {
   console.log(`  STRIP: @xenova/transformers/node_modules/sharp/ (${mb(size)})`);
 }
 
-// ─── Strip .md, LICENSE, .map, tests, docs from ALL native modules ───────────
+// ─── Strip junk files from native modules ─────────────────────────────────────
 
 const STRIP_PATTERNS = ['.md', '.txt', '.map', '.ts', '.flow'];
 const STRIP_DIRS = ['test', 'tests', '__tests__', 'docs', 'doc', 'example', 'examples', '.github'];
@@ -274,7 +257,6 @@ if (existsSync(pdfjsWorkerSrc) && !existsSync(pdfjsWorkerDest)) {
   console.log('  OK: pdfjs-dist worker');
 }
 
-// Copy llama-server shared libraries into standalone
 const libDir = join(ROOT, 'src-tauri', 'binaries');
 const libDest = join(STANDALONE, 'lib');
 if (existsSync(libDir)) {

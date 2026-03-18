@@ -68,15 +68,12 @@ export default function StartupScreen({ onReady }: { onReady: () => void }) {
         stopPolling();
         setDownloading(false);
 
-        // Model just downloaded — start llama-server now.
-        // The Rust startup thread already exited (model didn't exist at launch),
-        // so we must explicitly trigger a lazy start.
+        // Rust startup thread already exited (model didn't exist at launch),
+        // so explicitly trigger a lazy start for the llama-server.
         try {
           await invoke('start_llama_lazy');
         } catch (e) {
           console.warn('[Startup] llama-server start deferred:', e);
-          // Non-fatal: server may take time to load the model.
-          // AI features will become available once it's ready.
         }
       }
 
@@ -98,8 +95,6 @@ export default function StartupScreen({ onReady }: { onReady: () => void }) {
   return (
     <div className="fixed inset-0 z-[9999] flex items-center justify-center bg-background">
       <div className="flex flex-col items-center gap-6 max-w-md px-8 text-center">
-        {/* App title removed from startup */}
-
         {downloading && (
           <div className="flex flex-col items-center gap-4 w-full">
             <p className="text-sm text-muted-foreground">

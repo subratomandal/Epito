@@ -6,7 +6,7 @@ import {
   RefreshCw, Copy, Check, Send,
   PanelRightClose, PanelRight,
 } from 'lucide-react';
-import { stripHtml } from '@/lib/utils';
+import { stripHtml } from '@/common/utils';
 
 const STOP_WORDS = new Set([
   'the','be','to','of','and','a','in','that','have','i','it','for','not','on','with',
@@ -43,31 +43,6 @@ function extractTopics(text: string): string[] {
     .sort((a, b) => b.score - a.score)
     .slice(0, 10)
     .map(s => s.word);
-}
-
-function cleanSummaryText(text: string): string {
-  return text
-    .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
-    .replace(/_{1,3}([^_]+)_{1,3}/g, '$1')
-    .replace(/`{1,3}([^`]+)`{1,3}/g, '$1')
-    .replace(/^#{1,6}\s*/gm, '')
-    .replace(/[<>{}[\]\\|~^]/g, '')
-    .replace(/^(Summary|Here is|Here's|The following|Below is)[:\s]*/im, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .trim();
-}
-
-function cleanExplainText(text: string): string {
-  return text
-    .replace(/\*{1,3}([^*]+)\*{1,3}/g, '$1')
-    .replace(/_{1,3}([^_]+)_{1,3}/g, '$1')
-    .replace(/`{1,3}([^`]+)`{1,3}/g, '$1')
-    .replace(/^#{1,6}\s*/gm, '')
-    .replace(/^[\s]*[•\-\*]\s+/gm, '')
-    .replace(/[<>{}[\]\\|~^]/g, '')
-    .replace(/\n{3,}/g, '\n\n')
-    .replace(/[ \t]+/g, ' ')
-    .trim();
 }
 
 function cleanChatText(text: string): string {
@@ -134,16 +109,6 @@ function parseStructuredSummary(text: string): StructuredCategory[] {
 interface SentenceExplanation {
   text: string;
   explanation: string;
-}
-
-function parseExplainFromText(llmOutput: string, originalText: string): SentenceExplanation[] {
-  const preview = originalText.length > 80
-    ? originalText.slice(0, 80).trim() + '...'
-    : originalText.trim();
-
-  const explanation = llmOutput.replace(/^\[\d+\]\s*/gm, '').trim();
-
-  return [{ text: preview, explanation }];
 }
 
 interface StreamRetrievalData {
@@ -243,8 +208,6 @@ async function readStream(
   return fullText;
 }
 
-// ─── Skeleton Loading ─────────────────────────────────────────────────────────
-
 function SkeletonBlock({ lines = 3, message }: { lines?: number; message?: string }) {
   return (
     <div className="py-1.5 space-y-1.5">
@@ -269,10 +232,6 @@ function SkeletonBlock({ lines = 3, message }: { lines?: number; message?: strin
       `}</style>
     </div>
   );
-}
-
-function EpitoThinkingAnimation({ message }: { message?: string }) {
-  return <SkeletonBlock lines={3} message={message} />;
 }
 
 interface ChatSource {
@@ -567,97 +526,11 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
     document.addEventListener('mouseup', onMouseUp);
   }, [panelWidth]);
 
-  const saveCacheResult = useCallback(async (chunkId: string, type: 'summary' | 'explanation', result: string) => {
-    try {
-      await fetch('/api/ai/cache', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chunkId, type, result }),
-      });
-    } catch {}
-  }, []);
-
-  const processSection = useCallback(async (chunks: string[], idx: number, prevSummaries: string[], cacheIds: string[]) => {
-    const docId = noteIdRef.current;
-    const signal = abortRef.current.signal;
-
-    setCurrentSectionIdx(idx);
-    setCurrentStreamText('');
-    setSummaryPhase('streaming');
-    setProgressMsg(`Processing section ${idx + 1} of ${chunks.length}...`);
-
-    try {
-      const previousPoints = prevSummaries.join('\n\n');
-
-      const streamRes = await fetch('/api/ai/stream', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          action: 'summarize-section',
-          sectionText: chunks[idx],
-          sectionIndex: idx,
-          totalSections: chunks.length,
-          previousPoints,
-        }),
-        signal,
-      });
-
-      if (noteIdRef.current !== docId) return;
-
-      if (!streamRes.ok) {
-        const errData = await streamRes.json().catch(() => ({}));
-        const errMsg = errData.error || `Error ${streamRes.status}`;
-        if (noteIdRef.current !== docId) return;
-        setSectionSummaries(prev => [...prev, errMsg]);
-        setSummaryPhase(idx >= chunks.length - 1 ? 'all-done' : 'section-done');
-        setProgressMsg('');
-        return;
-      }
-
-      let sectionResult = '';
-      await readStream(streamRes, (t) => {
-        if (noteIdRef.current !== docId) return;
-        sectionResult = t;
-        setCurrentStreamText(t);
-      }, undefined, (err) => {
-        sectionResult = err;
-      }, signal);
-
-      if (noteIdRef.current !== docId) return;
-
-      if (cacheIds[idx]) {
-        saveCacheResult(cacheIds[idx], 'summary', sectionResult);
-      }
-
-      const newSummaries = [...prevSummaries, sectionResult];
-      setSectionSummaries(newSummaries);
-      setCurrentStreamText('');
-      setProgressMsg('');
-
-      if (chunks.length === 1) {
-        setMergedSummary(sectionResult);
-        setSummaryPhase('merged');
-      } else if (idx >= chunks.length - 1) {
-        setSummaryPhase('all-done');
-      } else {
-        setSummaryPhase('section-done');
-      }
-    } catch (err: unknown) {
-      if (err instanceof DOMException && err.name === 'AbortError') return;
-      if (noteIdRef.current !== docId) return;
-      console.error('Section error:', err);
-      setSectionSummaries(prev => [...prev, 'Failed to process section.']);
-      setSummaryPhase(idx >= chunks.length - 1 ? 'all-done' : 'section-done');
-      setProgressMsg('');
-    }
-  }, [saveCacheResult]);
-
-  // Refs to hold block state across batch requests
   const blocksRef = useRef<string[]>([]);
   const blockSummariesRef = useRef<string[]>([]);
   const batchStartRef = useRef(0);
 
-  // Process exactly 3 blocks via backend, then stop completely
+  // Process 3 blocks per batch, then pause for user to continue
   const runBatch = useCallback(async (startIdx: number) => {
     const docId = noteIdRef.current;
     const signal = abortRef.current.signal;
@@ -682,7 +555,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
       await readStream(res, () => {},
         (msg) => { if (noteIdRef.current === docId) setProgressMsg(msg); },
         undefined, signal, undefined,
-        // onBlockDone — block finished, add to completed list
         (event) => {
           if (noteIdRef.current !== docId) return;
           blockSummariesRef.current = [...blockSummariesRef.current, event.summary];
@@ -691,7 +563,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
           setCurrentStreamText('');
           setProgressMsg('');
         },
-        // onBlockStream — typing animation for current block
         (event) => {
           if (noteIdRef.current !== docId) return;
           setCurrentStreamText(event.text);
@@ -704,7 +575,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
       batchStartRef.current = startIdx + 3;
 
       if (batchStartRef.current >= blocksRef.current.length) {
-        // All blocks done — run final synthesis
         setSummaryPhase('merging');
         setCurrentStreamText('');
         const synthRes = await fetch('/api/ai/stream', {
@@ -725,7 +595,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
         setCurrentStreamText('');
         setSummaryPhase('merged');
       } else {
-        // More blocks remain — STOP. Show Continue button.
         setSummaryPhase('section-done');
         setProgressMsg('');
       }
@@ -735,7 +604,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
     }
   }, []);
 
-  // Continue button handler — resumes the next batch
   const handleContinue = useCallback(() => {
     runBatch(batchStartRef.current);
   }, [runBatch]);
@@ -773,7 +641,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
         if (noteIdRef.current !== docId) return;
       }
 
-      // Ask backend: short note (direct summary) or long note (returns blocks)
       const res = await fetch('/api/ai/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -786,7 +653,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
         return;
       }
 
-      // Parse response — could be { blocks: [...] } or streaming text
       let gotBlocks = false;
       let finalResult = '';
 
@@ -808,12 +674,10 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
           try {
             const parsed = JSON.parse(trimmed.slice(6));
             if (parsed.blocks) {
-              // Long note — backend returned blocks to process in batches
               blocksRef.current = parsed.blocks;
               gotBlocks = true;
             }
             if (parsed.text) {
-              // Short note — streaming direct summary
               finalResult = parsed.text;
               setSummaryPhase('merging');
               setCurrentStreamText(parsed.text);
@@ -826,7 +690,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
       if (noteIdRef.current !== docId) return;
 
       if (gotBlocks) {
-        // Start first batch of 3
         await runBatch(0);
       } else if (finalResult) {
         setMergedSummary(finalResult);
@@ -843,7 +706,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
     }
   }, [noteId, hasContent, plainText, runBatch]);
 
-  // Explain pipeline: 100-word chunks, one at a time, Continue between each
   const explainChunksRef = useRef<string[]>([]);
   const explainIdxRef = useRef(0);
   const explainResultsRef = useRef<string[]>([]);
@@ -936,7 +798,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
         return;
       }
 
-      // Parse chunks from response
       const reader = res.body?.getReader();
       if (!reader) { setExplainPhase('all-done'); return; }
       const decoder = new TextDecoder();
@@ -976,10 +837,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
       setExplainPhase('all-done');
     }
   }, [noteId, hasContent, plainText, explainOneChunk]);
-
-  const loadNextExplainSection = useCallback(() => {
-    handleExplainContinue();
-  }, [handleExplainContinue]);
 
   const isGreeting = useCallback((msg: string): boolean => {
     const trimmed = msg.trim().toLowerCase();
@@ -1180,20 +1037,22 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
   }, [onTopicClick]);
 
   const switchToSummarize = useCallback(() => {
-    if (summaryPhase !== 'idle') {
-      setActiveMode('summarize');
-    } else {
+    setActiveMode('summarize');
+    const hasResults = sectionSummaries.length > 0 || mergedSummary;
+    const isLoading = summaryPhase === 'preparing' || summaryPhase === 'streaming' || summaryPhase === 'merging';
+    if (!hasResults && !isLoading) {
       runSummarize();
     }
-  }, [summaryPhase, runSummarize]);
+  }, [summaryPhase, sectionSummaries.length, mergedSummary, runSummarize]);
 
   const switchToExplain = useCallback(() => {
-    if (explainPhase !== 'idle') {
-      setActiveMode('explain');
-    } else {
+    setActiveMode('explain');
+    const hasResults = explainSections.length > 0;
+    const isLoading = explainPhase === 'preparing' || explainPhase === 'streaming';
+    if (!hasResults && !isLoading) {
       runExplain();
     }
-  }, [explainPhase, runExplain]);
+  }, [explainPhase, explainSections.length, runExplain]);
 
   const switchToChat = useCallback(() => {
     setActiveMode('chat');
@@ -1477,12 +1336,10 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                     )}
                   </div>
 
-                  {/* Skeleton — waiting for first block */}
                   {(summaryPhase === 'preparing' || (summaryPhase === 'streaming' && sectionSummaries.length === 0 && !currentStreamText)) && (
                     <SkeletonBlock lines={3} message={progressMsg || undefined} />
                   )}
 
-                  {/* Block summaries (long notes) + currently streaming block */}
                   {(sectionSummaries.length > 0 || (summaryPhase === 'streaming' && currentStreamText)) && summaryPhase !== 'merged' && summaryPhase !== 'merging' && (
                     <div className="space-y-1.5">
                       {sectionSummaries.map((section, i) => (
@@ -1497,7 +1354,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                         </div>
                       ))}
 
-                      {/* Currently streaming block — typing animation */}
                       {summaryPhase === 'streaming' && currentStreamText && (
                         <div className="rounded-md border border-border/60 overflow-hidden">
                           <div className="flex items-center gap-1.5 px-3 py-1 bg-muted/30 border-b border-border/40">
@@ -1513,12 +1369,10 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                         </div>
                       )}
 
-                      {/* Skeleton between blocks — waiting for next block to start */}
                       {summaryPhase === 'streaming' && !currentStreamText && progressMsg && (
                         <SkeletonBlock lines={2} message={progressMsg} />
                       )}
 
-                      {/* Continue button */}
                       {summaryPhase === 'section-done' && (
                         <button
                           onClick={handleContinue}
@@ -1530,7 +1384,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                     </div>
                   )}
 
-                  {/* Final summary / short note streaming with typing cursor */}
                   {summaryPhase === 'merging' && currentStreamText && (
                     <div className="rounded-md bg-muted/20 p-3 border border-border/30">
                       <p className="text-[12px] text-foreground/85 leading-[1.7] whitespace-pre-wrap">
@@ -1540,12 +1393,10 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                     </div>
                   )}
 
-                  {/* Skeleton before final summary */}
                   {summaryPhase === 'merging' && !currentStreamText && (
                     <SkeletonBlock lines={3} message="Writing final summary..." />
                   )}
 
-                  {/* Completed */}
                   {summaryPhase === 'merged' && mergedSummary && (
                     <StructuredSummaryView
                       text={mergedSummary}
@@ -1560,6 +1411,20 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                       showAllPoints={showAllPoints}
                       onToggleShowAll={(key) => setShowAllPoints(prev => ({ ...prev, [key]: !prev[key] }))}
                     />
+                  )}
+
+                  {summaryPhase === 'idle' && sectionSummaries.length === 0 && !mergedSummary && (
+                    <div className="flex flex-col items-center justify-center py-6 text-center space-y-2.5">
+                      <p className="text-[11px] text-muted-foreground/50">No summary yet</p>
+                      <button
+                        onClick={() => runSummarize()}
+                        disabled={isAnyLoading || !hasContent}
+                        className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-[11px] font-medium text-foreground bg-muted/40 hover:bg-accent border border-border/40 transition-colors disabled:opacity-40"
+                      >
+                        <RefreshCw size={12} />
+                        Generate Summary
+                      </button>
+                    </div>
                   )}
                 </div>
               )}
@@ -1607,12 +1472,10 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                     )}
                   </div>
 
-                  {/* Skeleton while waiting */}
                   {(explainPhase === 'preparing' || (explainPhase === 'streaming' && explainSections.length === 0 && !explainStreamText)) && (
                     <SkeletonBlock lines={3} message={progressMsg || undefined} />
                   )}
 
-                  {/* Completed explanation sections */}
                   {explainSections.length > 0 && (
                     <div className="space-y-1.5">
                       {explainSections.flat().filter(item => item.explanation).map((item, i) => (
@@ -1627,7 +1490,6 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                         </div>
                       ))}
 
-                      {/* Currently streaming explanation with typing cursor */}
                       {explainPhase === 'streaming' && explainStreamText && (
                         <div className="rounded-md border border-border/60 overflow-hidden">
                           <div className="flex items-center gap-1.5 px-3 py-1 bg-muted/30 border-b border-border/40">
@@ -1643,12 +1505,10 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                         </div>
                       )}
 
-                      {/* Skeleton between sections */}
                       {explainPhase === 'streaming' && !explainStreamText && progressMsg && (
                         <SkeletonBlock lines={2} message={progressMsg} />
                       )}
 
-                      {/* Continue button */}
                       {explainPhase === 'section-done' && (
                         <button
                           onClick={handleExplainContinue}
@@ -1660,13 +1520,26 @@ export default function AIPanel({ noteId, noteContent, onTopicClick, isMobile, o
                     </div>
                   )}
 
-                  {/* Short note: streaming directly */}
                   {explainSections.length === 0 && explainPhase === 'streaming' && explainStreamText && (
                     <div className="rounded-md bg-muted/20 p-3 border border-border/30">
                       <p className="text-[12px] text-foreground/85 leading-[1.7] whitespace-pre-wrap">
                         {explainStreamText}
                         <span className="inline-block w-[2px] h-3.5 bg-primary/60 animate-pulse ml-0.5 align-middle rounded-full" />
                       </p>
+                    </div>
+                  )}
+
+                  {explainPhase === 'idle' && explainSections.length === 0 && !explainStreamText && (
+                    <div className="flex flex-col items-center justify-center py-6 text-center space-y-2.5">
+                      <p className="text-[11px] text-muted-foreground/50">No explanation yet</p>
+                      <button
+                        onClick={() => runExplain()}
+                        disabled={isAnyLoading || !hasContent}
+                        className="flex items-center gap-1.5 px-4 py-2 rounded-lg text-[11px] font-medium text-foreground bg-muted/40 hover:bg-accent border border-border/40 transition-colors disabled:opacity-40"
+                      >
+                        <RefreshCw size={12} />
+                        Generate Explanation
+                      </button>
                     </div>
                   )}
                 </div>

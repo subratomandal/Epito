@@ -44,7 +44,7 @@
   html, body { overscroll-behavior: none; }
 }
 
-/* Mobile: prevent text zoom on input focus */
+/* Mobile: prevent text zoom on input focus (iOS Safari) */
 @media (max-width: 767px) {
   input, textarea, select { font-size: 16px !important; }
   .tiptap { font-size: 15px !important; min-height: 150px; }
@@ -61,12 +61,12 @@
 ::selection { background: rgba(59, 130, 246, 0.3); }
 
 /* TipTap Editor */
-.tiptap { @apply outline-none min-h-[200px] leading-relaxed; font-size: var(--editor-font-size, 16px); caret-color: transparent; }
+.tiptap { @apply outline-none min-h-[200px] leading-relaxed; font-size: var(--editor-font-size, 15px); caret-color: transparent; }
 .tiptap > *:first-child { margin-top: 0; }
 .tiptap p { @apply my-2; }
-.tiptap h1 { @apply font-bold mt-6 mb-3; font-size: calc(var(--editor-font-size, 16px) * 1.875); }
-.tiptap h2 { @apply font-bold mt-5 mb-2; font-size: calc(var(--editor-font-size, 16px) * 1.5); }
-.tiptap h3 { @apply font-semibold mt-4 mb-2; font-size: calc(var(--editor-font-size, 16px) * 1.25); }
+.tiptap h1 { @apply font-bold mt-6 mb-3; font-size: calc(var(--editor-font-size, 15px) * 1.875); }
+.tiptap h2 { @apply font-bold mt-5 mb-2; font-size: calc(var(--editor-font-size, 15px) * 1.5); }
+.tiptap h3 { @apply font-semibold mt-4 mb-2; font-size: calc(var(--editor-font-size, 15px) * 1.25); }
 .tiptap ul { @apply list-disc pl-6 my-2; }
 .tiptap ol { @apply list-decimal pl-6 my-2; }
 .tiptap li { @apply my-1; }
@@ -84,7 +84,7 @@
 }
 .tiptap hr { @apply border-border my-6; }
 .tiptap a { @apply text-primary underline underline-offset-2; }
-.tiptap mark { @apply bg-yellow-500/30 px-0.5 rounded; }
+.tiptap mark { @apply bg-blue-500 text-white px-0.5 rounded; }
 .tiptap ul[data-type="taskList"] { @apply list-none pl-0; }
 .tiptap ul[data-type="taskList"] li {
   @apply flex items-start gap-2 my-1;
@@ -97,7 +97,7 @@
   content: attr(data-placeholder);
 }
 
-/* Custom caret — scales with font size, smooth blink, replaces native caret */
+/* Custom caret */
 .custom-caret {
   display: inline-block;
   position: relative;
@@ -127,44 +127,39 @@
   @apply ring-2 ring-primary;
 }
 
-/* ProseMirror search decorations (Editor.tsx) */
+/* Search highlights */
 .search-hl { @apply bg-yellow-400/30 rounded-sm; }
 .search-hl-active { @apply bg-yellow-400/80 text-black rounded-sm; }
 
-/* Virtualised paragraph rendering — browser skips layout/paint for off-screen */
+/* Virtualised paragraph rendering */
 .virtual-para {
   content-visibility: auto;
   contain-intrinsic-size: auto 1.5em;
 }
 
-/* Cursor resize prevention during drag */
+/* Cursor override during drag */
 .resizing-col * { cursor: col-resize !important; }
 .resizing-row * { cursor: row-resize !important; }
 
-/* Image in viewer modal */
+/* Image viewer modal */
 .viewer-modal-image {
   max-width: none;
   max-height: none;
 }
 
-/* Topic highlight — applied when clicking a topic in the AI sidebar */
+/* Topic highlight */
 .topic-highlight {
   background: rgba(59, 130, 246, 0.25);
   border-radius: 2px;
   transition: background 0.3s ease;
 }
 
-/* Bounce animation for loading dots */
 @keyframes bounce {
   0%, 80%, 100% { transform: translateY(0); }
   40% { transform: translateY(-6px); }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   UX Micro-interactions & Loading States
-   ═══════════════════════════════════════════════════════════════════════ */
-
-/* ─── Skeleton Shimmer (replaces spinners for AI operations) ──────── */
+/* ─── Skeleton Shimmer ────────────────────────────────────────────── */
 .skeleton {
   background: linear-gradient(
     90deg,
@@ -185,7 +180,7 @@
   100% { background-position: -200% 0; }
 }
 
-/* ─── Button Press Feedback ───────────────────────────────────────── */
+/* ─── Button Press ────────────────────────────────────────────────── */
 button, [role="button"] {
   transition: transform 80ms ease, opacity 150ms ease, background-color 150ms ease, color 150ms ease;
 }
@@ -193,7 +188,7 @@ button:active:not(:disabled), [role="button"]:active:not(:disabled) {
   transform: scale(0.97);
 }
 
-/* ─── Note Card Animations ────────────────────────────────────────── */
+/* ─── Note Card Transitions ───────────────────────────────────────── */
 .note-enter {
   animation: note-pop-in 0.25s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
 }
@@ -209,7 +204,7 @@ button:active:not(:disabled), [role="button"]:active:not(:disabled) {
   to { opacity: 0; transform: translateX(12px); }
 }
 
-/* ─── AI Response Fade-in (paragraph by paragraph) ────────────────── */
+/* ─── AI Response Fade-in ─────────────────────────────────────────── */
 .ai-response p, .ai-response li, .ai-response h1,
 .ai-response h2, .ai-response h3, .ai-response div {
   animation: text-fade-up 0.3s ease-out both;
@@ -226,7 +221,7 @@ button:active:not(:disabled), [role="button"]:active:not(:disabled) {
   to { opacity: 1; transform: translateY(0); }
 }
 
-/* ─── Typing Indicator for Chat ───────────────────────────────────── */
+/* ─── Typing Indicator ────────────────────────────────────────────── */
 .typing-indicator {
   display: inline-flex;
   gap: 3px;
@@ -247,7 +242,7 @@ button:active:not(:disabled), [role="button"]:active:not(:disabled) {
   30% { transform: translateY(-4px); opacity: 1; }
 }
 
-/* ─── Toast Notification ──────────────────────────────────────────── */
+/* ─── Toast ───────────────────────────────────────────────────────── */
 .toast {
   position: fixed;
   bottom: 20px;
@@ -284,11 +279,7 @@ button:active:not(:disabled), [role="button"]:active:not(:disabled) {
   to { opacity: 1; }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════
-   App Launch / Exit / Splash
-   ═══════════════════════════════════════════════════════════════════════ */
-
-/* Reduced motion: skip all animations */
+/* ─── Reduced Motion ──────────────────────────────────────────────── */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
@@ -296,7 +287,7 @@ button:active:not(:disabled), [role="button"]:active:not(:disabled) {
   }
 }
 
-/* App content appears after splash */
+/* ─── App Launch ──────────────────────────────────────────────────── */
 body {
   opacity: 0;
   animation: epito-in 0.3s ease-out 0.05s forwards;
@@ -305,4 +296,3 @@ body {
 @keyframes epito-in {
   to { opacity: 1; }
 }
-

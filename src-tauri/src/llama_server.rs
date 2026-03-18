@@ -10,32 +10,22 @@ use crate::model;
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 enum GpuBackend {
-    Metal,    // macOS Apple Silicon / Intel — Metal GPU compute
-    Cuda,     // NVIDIA — fastest, needs ggml-cuda.dll + cudart
-    Vulkan,   // Any GPU vendor — universal fallback
-    Rocm,     // AMD on Linux
-    CpuOnly,  // No GPU offload
+    Metal,
+    Cuda,
+    Vulkan,
+    Rocm,
+    CpuOnly,
 }
 
-/// Detect the best GPU backend by checking BOTH hardware AND available DLLs.
-///
-/// Strategy (matches how Ollama, LM Studio, and Jan.ai do it):
-///   1. Detect GPU hardware (nvidia-smi, WMIC, etc.)
-///   2. Check which backend DLLs are actually present
-///   3. Pick the best available: CUDA > Vulkan > ROCm > CPU
-///
-/// This prevents selecting CUDA when only the Vulkan build was downloaded.
+/// Detect GPU backend by checking hardware AND available backend libraries.
+/// Prevents selecting CUDA when only the Vulkan build was downloaded.
 fn detect_gpu_backend(lib_dirs: &[std::path::PathBuf]) -> GpuBackend {
-    // --- macOS: always Metal ---
     if cfg!(target_os = "macos") {
-        log::info!("[GPU] macOS — Metal backend (Apple GPU compute)");
+        log::info!("[GPU] macOS — Metal backend");
         return GpuBackend::Metal;
     }
 
-    // --- Detect GPU hardware ---
     let gpu_vendor = detect_gpu_vendor();
-
-    // --- Check which backend DLLs/SOs are available ---
     let has_cuda_lib = find_lib_in_dirs(lib_dirs, "ggml-cuda");
     let has_vulkan_lib = find_lib_in_dirs(lib_dirs, "ggml-vulkan");
     let has_rocm_lib = find_lib_in_dirs(lib_dirs, "ggml-rocm");
@@ -45,7 +35,6 @@ fn detect_gpu_backend(lib_dirs: &[std::path::PathBuf]) -> GpuBackend {
         gpu_vendor, has_cuda_lib, has_vulkan_lib, has_rocm_lib
     );
 
-    // --- Select best backend based on hardware + available libs ---
     match gpu_vendor {
         GpuVendor::Nvidia => {
             if has_cuda_lib {
@@ -94,7 +83,7 @@ enum GpuVendor {
     None,
 }
 
-/// Create a Command with CREATE_NO_WINDOW on Windows to prevent console flash.
+/// Create a Command that suppresses console windows on Windows.
 fn silent_command(program: &str) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
@@ -107,7 +96,6 @@ fn silent_command(program: &str) -> Command {
 }
 
 fn detect_gpu_vendor() -> GpuVendor {
-    // Check NVIDIA via nvidia-smi (works on both Windows and Linux)
     if let Ok(output) = silent_command("nvidia-smi")
         .args(["--query-gpu=name", "--format=csv,noheader"])
         .stdout(Stdio::piped())
@@ -121,7 +109,6 @@ fn detect_gpu_vendor() -> GpuVendor {
         }
     }
 
-    // Windows: PowerShell (modern, works on Win10/11 even without WMIC)
     #[cfg(target_os = "windows")]
     {
         if let Some(vendor) = detect_gpu_via_powershell() {
@@ -129,7 +116,7 @@ fn detect_gpu_vendor() -> GpuVendor {
         }
     }
 
-    // Windows: WMIC fallback (deprecated but still works on most machines)
+    // WMIC fallback — deprecated but still works on most machines
     #[cfg(target_os = "windows")]
     {
         if let Some(vendor) = detect_gpu_via_wmic() {
@@ -137,7 +124,6 @@ fn detect_gpu_vendor() -> GpuVendor {
         }
     }
 
-    // Linux: check for AMD ROCm
     #[cfg(target_os = "linux")]
     {
         if silent_command("rocminfo")
@@ -215,8 +201,7 @@ fn detect_gpu_via_wmic() -> Option<GpuVendor> {
     None
 }
 
-/// Check if a backend library exists in any of the DLL search directories.
-/// Searches for `ggml-cuda.dll` / `libggml-cuda.dylib` / `libggml-cuda.so`.
+/// Check if a backend library exists in any of the search directories.
 fn find_lib_in_dirs(dirs: &[std::path::PathBuf], lib_base_name: &str) -> bool {
     let (prefix, ext) = if cfg!(target_os = "macos") {
         ("lib", ".dylib")
@@ -269,9 +254,6 @@ impl LlamaProcess {
 }
 
 pub fn find_llama_server(app: &tauri::AppHandle) -> Option<String> {
-    // Use the same find_binary_in_dir helper from lib.rs to find both
-    // "llama-server.exe" and "llama-server-x86_64-pc-windows-msvc.exe"
-
     if let Ok(resource_dir) = app.path().resource_dir() {
         log::info!("[llama-server] Checking resource dir: {:?}", resource_dir);
         if let Some(p) = crate::find_binary_in_dir(&resource_dir, "llama-server") {
@@ -353,13 +335,8 @@ pub fn start(
 
     let gpu = detect_gpu_backend(&dll_dirs);
 
-    // ── VRAM-aware GPU layer calculation (Ollama pattern) ──
-    // Instead of hardcoding --n-gpu-layers 99, query total VRAM and calculate
-    // how many layers safely fit. Prevents OOM crashes on 4-6GB GPUs.
-    // If VRAM is too low for any GPU offload, fall back to CPU.
+    // VRAM-aware layer calculation prevents OOM on 4-6GB GPUs
     let gpu_layers = calculate_gpu_layers_for_backend(gpu);
-
-    // If VRAM can't fit even 5 layers, switch to CPU instead of CUDA
     let (gpu, gpu_layers) = if gpu_layers == 0 && gpu != GpuBackend::CpuOnly {
         log::info!("[llama-server] Not enough VRAM for GPU offload — switching to CPU");
         (GpuBackend::CpuOnly, 0)
@@ -367,19 +344,11 @@ pub fn start(
         (gpu, gpu_layers)
     };
 
-    // ── Power-aware thread/batch adjustment ──
-    // On battery: reduce CPU threads (50%) and batch size (256 → from 512).
-    // GPU layers stay the same — the GPU's own power management handles throttling.
-    // On AC or desktops: use full resources.
+    // GPU layers unchanged on battery — GPU power management handles throttling
     let (adj_threads, batch_size) = adjust_for_power(threads);
-
-    // ── System memory check ──
-    // If total RAM < 8GB, disable --mlock to avoid starving the OS.
-    // The 4.3GB model with mlock would leave <4GB for Windows + Node.js.
     let use_mlock = check_mlock_safe();
 
-    // Try GPU backend first. If it fails (driver mismatch, VRAM too small),
-    // fall back to CPU. This matches how Ollama handles GPU init failures.
+    // GPU backend first, CPU fallback on failure (Ollama pattern)
     let result = spawn_llama_server(
         &binary, binary_dir, &dll_dirs, &model_path, port, adj_threads, gpu,
         gpu_layers, batch_size, use_mlock,
@@ -390,8 +359,7 @@ pub fn start(
             #[cfg(windows)]
             crate::win_job::assign(&child);
 
-            // Set llama-server to BELOW_NORMAL priority — prevents inference
-            // from starving the UI or other user applications (Chrome pattern).
+            // Chrome pattern: background workers get BELOW_NORMAL to avoid starving UI
             #[cfg(windows)]
             crate::native_win::set_process_priority(&child, crate::native_win::BELOW_NORMAL_PRIORITY);
 
@@ -400,7 +368,6 @@ pub fn start(
             Ok(port)
         }
         Err(e) if gpu != GpuBackend::CpuOnly => {
-            // GPU spawn failed — retry with CPU fallback
             log::warn!(
                 "[llama-server] {:?} backend failed: {}. Retrying with CPU fallback...", gpu, e
             );
@@ -424,33 +391,28 @@ pub fn start(
     }
 }
 
-/// Calculate GPU layers based on VRAM (CUDA) or use full offload (other backends).
+/// Calculate GPU layers based on available VRAM (CUDA) or full offload (other backends).
 fn calculate_gpu_layers_for_backend(gpu: GpuBackend) -> u32 {
     match gpu {
         GpuBackend::CpuOnly => 0,
         GpuBackend::Cuda => {
-            // Query VRAM (cached from startup diagnostics, no extra nvidia-smi call)
             #[cfg(windows)]
             {
                 if let Some(vram) = crate::native_win::query_gpu_vram() {
                     return crate::native_win::calculate_gpu_layers(vram.total_mb);
                 }
-                // nvidia-smi unavailable — full offload, let llama.cpp handle it
                 log::warn!("[GPU] Could not query VRAM — using full offload (99 layers)");
                 99
             }
             #[cfg(not(windows))]
             { 99 }
         }
-        // Metal, Vulkan, ROCm — no VRAM query mechanism, use full offload.
-        // llama.cpp will gracefully handle insufficient VRAM for these backends.
+        // Metal/Vulkan/ROCm: llama.cpp handles insufficient VRAM gracefully
         _ => 99,
     }
 }
 
-/// Adjust threads and batch size for battery power.
-/// On battery: halve threads (reduces CPU power draw), reduce batch size.
-/// On AC/desktop: use full resources.
+/// Halve threads and reduce batch size on battery to lower CPU power draw.
 fn adjust_for_power(threads: usize) -> (usize, usize) {
     #[cfg(windows)]
     {
@@ -467,9 +429,7 @@ fn adjust_for_power(threads: usize) -> (usize, usize) {
     (threads, 512)
 }
 
-/// Check if --mlock is safe given available system RAM.
-/// Mlock pins the 4.3GB model in physical RAM. On systems with <8GB total,
-/// this starves the OS and Node.js, causing severe swapping.
+/// Disable --mlock on <8GB systems to prevent OS starvation from pinning the 4.3GB model.
 fn check_mlock_safe() -> bool {
     #[cfg(windows)]
     {
@@ -517,8 +477,7 @@ fn build_args(
         GpuBackend::Metal => {
             log::info!("[llama-server] Backend: Metal ({} layers, flash-attn)", gpu_layers);
             args.extend(["--n-gpu-layers".into(), gpu_layers.to_string()]);
-            // macOS uses older llama.cpp (b4722) where --flash-attn is a boolean flag.
-            // Windows uses b8340+ where --flash-attn takes "on"/"off" argument.
+            // macOS b4722: boolean flag; Windows b8340+: takes "on"/"off" argument
             #[cfg(target_os = "macos")]
             args.push("--flash-attn".into());
             #[cfg(not(target_os = "macos"))]
@@ -566,7 +525,6 @@ fn spawn_llama_server(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Windows: add DLL directories to PATH for the child process
     #[cfg(target_os = "windows")]
     {
         let mut path_dirs: Vec<String> = vec![binary_dir.to_string_lossy().to_string()];
@@ -628,9 +586,7 @@ pub fn wait_ready(port: u16, timeout: Duration) -> bool {
                         "[llama-server] ✓ Ready on port {} ({:.1}s, {} attempts)",
                         port, elapsed, attempt
                     );
-                    // Log GPU validation: if the server responded with model loaded,
-                    // the selected backend initialized successfully.
-                    log::info!("[llama-server] ✓ GPU backend initialized, model loaded, inference ready");
+                    log::info!("[llama-server] GPU backend initialized, model loaded, inference ready");
                     return true;
                 }
                 if attempt <= 3 || attempt % 10 == 0 {
@@ -658,36 +614,31 @@ pub fn get_port(state: &LlamaProcess) -> u16 {
     *state.port.lock().unwrap()
 }
 
-/// Returns all directories that might contain shared libraries for llama-server.
+/// Collect all directories that may contain shared libraries for llama-server.
 fn find_lib_directories(app: &tauri::AppHandle, binary_dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
 
-    // 1. Same directory as the binary itself
     if binary_dir.exists() {
         dirs.push(binary_dir.to_path_buf());
     }
 
     if let Ok(res_dir) = app.path().resource_dir() {
-        // 2. Libs bundled inside standalone via prepareStandalone.mjs
         let standalone_lib = res_dir.join("_up_").join(".next").join("standalone").join("lib");
         if standalone_lib.exists() {
             log::info!("[llama-server] Found standalone lib dir: {:?}", standalone_lib);
             dirs.push(standalone_lib);
         }
 
-        // 3. binaries/ subfolder in resources
         let res_binaries = res_dir.join("binaries");
         if res_binaries.exists() {
             dirs.push(res_binaries);
         }
 
-        // 4. Resource dir root
         if res_dir.exists() {
             dirs.push(res_dir);
         }
     }
 
-    // 5. Dev paths
     let dev_bins = std::path::PathBuf::from("src-tauri/binaries");
     if dev_bins.exists() {
         if let Ok(canonical) = dev_bins.canonicalize() {
@@ -700,8 +651,7 @@ fn find_lib_directories(app: &tauri::AppHandle, binary_dir: &std::path::Path) ->
     dirs
 }
 
-/// Best-effort copy of shared libs from `src_dir` to `dest_dir`.
-/// May fail silently (e.g. writing to Program Files without admin).
+/// Best-effort copy of shared libs to binary dir. Fails silently (e.g. no admin access).
 fn copy_libs_from_dir(src_dir: &std::path::Path, dest_dir: &std::path::Path) {
     if !src_dir.exists() || src_dir == dest_dir {
         return;
@@ -724,9 +674,9 @@ fn copy_libs_from_dir(src_dir: &std::path::Path, dest_dir: &std::path::Path) {
         let name = entry.file_name().to_string_lossy().to_string();
         let is_shared_lib = extensions.iter().any(|ext| name.ends_with(ext));
         let has_valid_prefix = if cfg!(target_os = "windows") {
-            true // Windows DLLs: ggml.dll, llama.dll (no "lib" prefix)
+            true // Windows DLLs have no "lib" prefix
         } else {
-            name.starts_with("lib") // Unix: libggml.dylib
+            name.starts_with("lib")
         };
 
         if is_shared_lib && has_valid_prefix {

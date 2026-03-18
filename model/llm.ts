@@ -1,7 +1,7 @@
 import { extractFocusedContext } from './answer-engine';
-import { generateEmbedding } from './embeddings';
-import { cosineSimilarity } from './vector';
-import * as db from '@/lib/database';
+import { generateEmbedding } from '@/memory/embeddings';
+import { cosineSimilarity } from '@/memory/vector';
+import * as db from '@/notes/database';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -10,53 +10,50 @@ const LLAMA_PORT = process.env.LLAMA_SERVER_PORT || '8080';
 const LLAMA_URL = `http://127.0.0.1:${LLAMA_PORT}`;
 const MODEL = 'mistral-7b-instruct';
 
-// ─── ChatGPT-Style Two-Tier Idle Memory Reclaim ─────────────────────────────
-// Tier 1: idle > 10s → clear KV cache (frees ~200MB, process stays alive)
-// Tier 2: idle > 30s → kill worker process (frees all ~4.5GB)
-// Matches ephemeral worker model used in ChatGPT desktop, Ollama, LM Studio.
-const KV_CLEAR_TIMEOUT_MS = 10_000;      // Tier 1: KV cache eviction
-const PROCESS_KILL_TIMEOUT_MS = 30_000;   // Tier 2: full process destruction
+// --- Instant Offload Architecture
+// KV cache cleared instantly after inference. Process killed after idle timeout.
+// Lifecycle: idle -> on-demand spawn -> inference -> KV clear -> idle timeout -> kill.
+const PROCESS_KILL_TIMEOUT_MS = 30_000;   // Kill process after 30s idle
 
 // Signal file directory (shared with Rust runtime controller)
 const DATA_DIR = process.env.EPITO_DATA_DIR || path.join(os.homedir(), '.epito', 'data');
 
-console.log(`[LLM] Runtime: url=${LLAMA_URL}, model=${MODEL}, kv_clear=${KV_CLEAR_TIMEOUT_MS / 1000}s, kill=${PROCESS_KILL_TIMEOUT_MS / 1000}s`);
+console.log(`[LLM] Runtime: url=${LLAMA_URL}, model=${MODEL}, offload=instant, kill=${PROCESS_KILL_TIMEOUT_MS / 1000}s`);
 
 let inferenceActive = false;
 const inferenceQueue: Array<{ resolve: () => void }> = [];
 
-// ─── Idle Memory Management (Two-Tier Architecture) ─────────────────────────
-// Uses file-based signaling to communicate with the Rust runtime controller.
-// Signal files: .idle-stop (kill process), .idle-start (restart process)
-// Tier 1 (KV clear) is done directly via HTTP to llama-server (no Rust roundtrip).
+// --- Instant Offload Engine
+// holdServer(): keep process alive. releaseServer(): KV clear + schedule kill.
 
-let kvClearTimer: ReturnType<typeof setTimeout> | null = null;
 let processKillTimer: ReturnType<typeof setTimeout> | null = null;
 let llamaServerRunning = false;
 
-function resetIdleTimer(): void {
-  if (kvClearTimer) clearTimeout(kvClearTimer);
-  if (processKillTimer) clearTimeout(processKillTimer);
+/** Cancel pending kill timer — called BEFORE inference to keep server alive. */
+function holdServer(): void {
+  if (processKillTimer) {
+    clearTimeout(processKillTimer);
+    processKillTimer = null;
+  }
   llamaServerRunning = true;
-
-  // Tier 1: Clear KV cache after 10s idle (frees attention memory, process stays)
-  kvClearTimer = setTimeout(clearKvCacheIdle, KV_CLEAR_TIMEOUT_MS);
-
-  // Tier 2: Kill worker process after 30s idle (frees all memory)
-  processKillTimer = setTimeout(killLlamaProcessIdle, PROCESS_KILL_TIMEOUT_MS);
 }
 
-async function clearKvCacheIdle(): Promise<void> {
-  if (!llamaServerRunning) return;
-  try {
-    await fetch(`${LLAMA_URL}/slots/0?action=erase`, {
-      method: 'POST',
-      signal: AbortSignal.timeout(3000),
-    });
-    console.log('[LLM] Tier 1: KV cache cleared (idle 10s). ~200MB freed. Process alive.');
-  } catch {
-    // Server might already be dead — tier 2 will handle it
-  }
+/** Instant KV clear + schedule process kill — called AFTER inference completes. */
+function releaseServer(): void {
+  // Tier 1: INSTANT KV cache eviction (fire-and-forget, non-blocking)
+  // Frees ~200MB of attention memory immediately. Process stays alive.
+  fetch(`${LLAMA_URL}/slots/0?action=erase`, {
+    method: 'POST',
+    signal: AbortSignal.timeout(3000),
+  }).then(() => {
+    console.log('[LLM] KV cache cleared instantly after inference. ~200MB freed.');
+  }).catch(() => {
+    // Server might already be dead — kill timer handles cleanup
+  });
+
+  // Tier 2: Schedule full process kill after idle timeout
+  if (processKillTimer) clearTimeout(processKillTimer);
+  processKillTimer = setTimeout(killLlamaProcessIdle, PROCESS_KILL_TIMEOUT_MS);
 }
 
 function killLlamaProcessIdle(): void {
@@ -67,13 +64,13 @@ function killLlamaProcessIdle(): void {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     fs.writeFileSync(path.join(DATA_DIR, '.idle-stop'), '', { flag: 'w' });
     llamaServerRunning = false;
-    console.log('[LLM] Tier 2: llama-server kill signaled (idle 30s). Full memory reclaim.');
+    console.log('[LLM] Process kill signaled (idle 30s). Full memory reclaim.');
   } catch (e) {
     console.error('[LLM] Failed to write idle-stop signal:', e);
   }
 }
 
-async function ensureLlamaRunning(): Promise<void> {
+export async function ensureLlamaRunning(): Promise<void> {
   // Fast path: if we believe it's running, verify with health check
   if (llamaServerRunning) {
     try {
@@ -82,6 +79,12 @@ async function ensureLlamaRunning(): Promise<void> {
     } catch {}
     // Health failed — server died unexpectedly
     llamaServerRunning = false;
+  }
+
+  // Cancel any pending kill timer — we need the server NOW
+  if (processKillTimer) {
+    clearTimeout(processKillTimer);
+    processKillTimer = null;
   }
 
   // Server not running — signal Rust runtime controller to spawn worker
@@ -94,8 +97,9 @@ async function ensureLlamaRunning(): Promise<void> {
     throw new Error('Cannot signal llama-server restart');
   }
 
-  // Poll health endpoint until worker is ready (model loading takes 30-120s)
-  const maxWait = 180_000; // 3 minute max wait
+  // Aggressive polling: 100ms for first 10 attempts (1s), then 500ms
+  // This shaves 400-900ms off the startup detection vs the old 500ms/1s pattern
+  const maxWait = 180_000;
   const start = Date.now();
   let attempt = 0;
 
@@ -109,8 +113,8 @@ async function ensureLlamaRunning(): Promise<void> {
         return;
       }
     } catch {}
-    // Exponential backoff: 500ms, 1s, 1s, 1s...
-    await new Promise(r => setTimeout(r, attempt <= 2 ? 500 : 1000));
+    // Aggressive polling: 100ms for first 10 attempts, then 500ms
+    await new Promise(r => setTimeout(r, attempt <= 10 ? 100 : 500));
   }
   throw new Error('llama-server failed to start within 180s');
 }
@@ -217,7 +221,7 @@ async function callLlama(prompt: string, systemPrompt: string, maxTokens?: numbe
   const effectiveMax = adaptiveMaxTokens(maxTokens);
 
   await acquireInferenceLock();
-  resetIdleTimer();
+  holdServer();
   const startTime = Date.now();
 
   try {
@@ -251,6 +255,7 @@ async function callLlama(prompt: string, systemPrompt: string, maxTokens?: numbe
   } finally {
     recordInferenceTime(Date.now() - startTime);
     releaseInferenceLock();
+    releaseServer();
   }
 }
 
@@ -263,7 +268,7 @@ async function* callLlamaStream(prompt: string, systemPrompt: string, maxTokens?
   const effectiveMax = adaptiveMaxTokens(maxTokens);
 
   await acquireInferenceLock();
-  resetIdleTimer();
+  holdServer();
   const startTime = Date.now();
 
   try {
@@ -324,6 +329,7 @@ async function* callLlamaStream(prompt: string, systemPrompt: string, maxTokens?
   } finally {
     recordInferenceTime(Date.now() - startTime);
     releaseInferenceLock();
+    releaseServer();
   }
 }
 
@@ -389,25 +395,13 @@ const MAX_OUTPUT_TOKENS = 200;
 
 const SYSTEM_PROMPT = `You are a world-class analyst. Produce comprehensive, insightful summaries that explain the meaning and significance of the content.`;
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Extractive-Abstractive Hierarchical Summarization Pipeline
-//
-// Architecture (centroid-based, minimizes LLM calls):
-//   1. Sentence segmentation
-//   2. Embedding-based centroid ranking (select top-40 sentences, zero LLM)
-//   3. Topic clustering via k-means on embeddings
-//   4. Per-cluster LLM summaries (4-8 calls, ~150 words each)
-//   5. Entity extraction from cluster summaries
-//   6. Redundancy removal via embedding similarity
-//   7. Final global synthesis (1 LLM call, up to 1000 words)
-//
-// Total LLM calls: 5-9 (vs naive: 1 huge call or 15+ chunk calls)
-// Prevents: context overflow, GPU overheating, entity loss, fragmentation
-// ═══════════════════════════════════════════════════════════════════════════════
+// --- Extractive-Abstractive Hierarchical Summarization Pipeline
+// Centroid-based: TextRank select -> embed -> k-means cluster -> per-cluster LLM -> global synthesis.
+// 5-9 LLM calls total.
 
 const SUMMARY_PARAMS = { temperature: 0.6, repeat_penalty: 1.1, top_p: 0.9, top_k: 50 };
 
-// ─── Stage 1: Length Router ──────────────────────────────────────────────────
+// --- Length Router
 
 type SumStrategy = 'passthrough' | 'direct' | 'hierarchical';
 
@@ -417,7 +411,7 @@ function routeNote(wordCount: number): SumStrategy {
   return 'hierarchical';
 }
 
-// ─── Sentence Segmentation ───────────────────────────────────────────────────
+// --- Sentence Segmentation
 
 function smartSplitSentences(text: string): string[] {
   return text
@@ -427,10 +421,8 @@ function smartSplitSentences(text: string): string[] {
     .filter(s => s.length > 0);
 }
 
-// ─── Two-Phase Sentence Ranking (minimal compute) ────────────────────────────
-// Phase 1: TextRank (word-overlap graph, ZERO model calls) → select top 60
-// Phase 2: Embed only those 60 sentences for clustering (not all 150+)
-// This cuts embedding calls by 60-75% vs embedding every sentence.
+// --- Two-Phase Sentence Ranking
+// Phase 1: TextRank (zero model calls) -> top 60. Phase 2: embed only those for clustering.
 
 function textRankSelect(sentences: string[], topN: number): { sentence: string; index: number; score: number }[] {
   const n = sentences.length;
@@ -493,9 +485,8 @@ async function embedSelectedSentences(
   return results;
 }
 
-// ─── K-Means Topic Clustering ────────────────────────────────────────────────
-// Groups important sentences into topic clusters to ensure the summary
-// covers all topics in the document, not just the most prominent one.
+// --- K-Means Topic Clustering
+// Groups sentences into topic clusters for full-document coverage.
 
 function kMeansCluster(
   items: { embedding: number[]; sentence: string; index: number }[],
@@ -562,7 +553,7 @@ function kMeansCluster(
   return clusters.filter(c => c.length > 0).sort((a, b) => a[0].index - b[0].index);
 }
 
-// ─── Summary Validation ──────────────────────────────────────────────────────
+// --- Summary Validation
 
 function validateSummary(summary: string, source: string): string {
   if (!summary || summary.trim().length < 10) return '';
@@ -585,9 +576,8 @@ function validateSummary(summary: string, source: string): string {
   return cleanSummaryOutput(result);
 }
 
-// ─── Progressive Summarization (Public API) ──────────────────────────────────
-// Processes the document in ~300-word blocks, yielding structured events.
-// The UI shows each block summary as it arrives with a loading animation between.
+// --- Progressive Summarization (Public API)
+// Processes document in ~300-word blocks, yielding structured events for streaming UI.
 
 export type SummaryEvent =
   | { type: 'progress'; message: string }
@@ -735,13 +725,8 @@ export async function summarizeChunks(chunks: string[]): Promise<{ summary: stri
   return summarizeText(chunks.join('\n\n'));
 }
 
-// ─── Extractive-Abstractive Pipeline ─────────────────────────────────────────
-// Step 1: Sentence segmentation
-// Step 2: Centroid ranking (embedding-based, zero LLM)
-// Step 3: K-means topic clustering
-// Step 4: Per-cluster LLM summaries
-// Step 5: Entity extraction + redundancy removal
-// Step 6: Global synthesis
+// --- Extractive-Abstractive Pipeline
+// Segment -> rank -> cluster -> per-cluster LLM -> entity extraction -> global synthesis
 
 async function extractiveAbstractivePipeline(text: string): Promise<{
   clusterSummaries: string[];
@@ -966,15 +951,8 @@ export function getGreetingResponse(): string {
   return GREETING_RESPONSES[Math.floor(Math.random() * GREETING_RESPONSES.length)];
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// Mistral 7B Chat Pipeline — 8-step architecture for response quality
-//
-// Pipeline: frustration → correction → intent → rewrite → retrieve →
-//           assemble → generate → validate
-//
-// Fixes: entity fixation, incomplete extraction, context poisoning,
-//        coreference failure, correction blindness, frustration spiral
-// ═══════════════════════════════════════════════════════════════════════════════
+// --- Mistral 7B Chat Pipeline (8-step)
+// frustration -> correction -> intent -> rewrite -> retrieve -> assemble -> generate -> validate
 
 type ChatMessage = { role: string; content: string };
 type ChatIntent = 'EXHAUSTIVE_LIST' | 'PERSON_QUERY' | 'FACT_LOOKUP' | 'YES_NO' | 'SUMMARY_REQUEST' | 'COMPARISON' | 'FOLLOW_UP' | 'CORRECTION' | 'TOPIC_CHANGE';
@@ -996,10 +974,8 @@ const recentResponses: string[] = [];
 // Tier 2 = pinned facts (persist until explicitly changed by user).
 const pinnedFacts: string[] = [];
 
-// ─── Entity Context Builder ──────────────────────────────────────────────────
-// Queries the entity index to build a structured relationship graph.
-// Prevents entity relation collapse by giving the model explicit
-// Person→Institution, Tool→Project relationships before raw text.
+// --- Entity Context Builder
+// Builds structured relationship graph from entity index to prevent entity relation collapse.
 
 function buildEntityContext(query: string): string {
   try {
@@ -1065,7 +1041,7 @@ function buildEntityContext(query: string): string {
   }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// --- Helpers
 
 function countTk(text: string): number { return Math.ceil(text.split(/\s+/).length * 1.3); }
 function truncTk(text: string, max: number): string {
@@ -1084,9 +1060,8 @@ async function quickCall(prompt: string, maxTk = 50): Promise<string> {
   return '';
 }
 
-// ─── Step 0: Distress Detection (runs BEFORE everything, no model call) ──────
-// ISACA 2025 documented lawsuits against AI apps that failed to handle distress.
-// This is a legal and ethical requirement, not a feature.
+// --- Distress Detection (pre-pipeline, no model call)
+// Legal/ethical requirement per ISACA 2025.
 
 const DISTRESS_RE = /\b(hate my life|want to die|kill myself|end it all|no point in living|suicide|self.?harm|hurt myself|nobody cares|worthless|hopeless|can'?t go on|don'?t want to live)\b/i;
 
@@ -1096,7 +1071,7 @@ function detectDistress(msg: string): boolean {
   return DISTRESS_RE.test(msg);
 }
 
-// ─── Step 1: Frustration Detection ───────────────────────────────────────────
+// --- Frustration Detection
 
 const FRUSTRATION_RE = /\b(dumb|stupid|wtf|idiot|useless|wrong again|i already said|i told you|i just asked|for the .* time|forget it|never mind|are you even reading|not what i asked|that's not it|no that's wrong|you're wrong|still wrong)\b/i;
 
@@ -1104,7 +1079,7 @@ function detectFrustration(msg: string): boolean {
   return FRUSTRATION_RE.test(msg);
 }
 
-// ─── Step 2: Correction Detection ────────────────────────────────────────────
+// --- Correction Detection
 
 function detectCorrection(msg: string, lastResponse: string): { isCorrection: boolean; assertion: string } {
   if (!lastResponse) return { isCorrection: false, assertion: '' };
@@ -1119,7 +1094,7 @@ function detectCorrection(msg: string, lastResponse: string): { isCorrection: bo
   return { isCorrection: false, assertion: '' };
 }
 
-// ─── Step 3: Intent Classification ───────────────────────────────────────────
+// --- Intent Classification
 
 function classifyIntent(msg: string, isCorrection: boolean): ChatIntent {
   if (isCorrection) return 'CORRECTION';
@@ -1135,7 +1110,7 @@ function classifyIntent(msg: string, isCorrection: boolean): ChatIntent {
   return 'FACT_LOOKUP';
 }
 
-// ─── Step 4: Query Rewriting ─────────────────────────────────────────────────
+// --- Query Rewriting
 
 async function rewriteQuery(raw: string, recent: ChatMessage[]): Promise<string> {
   if (recent.length === 0 || raw.split(/\s+/).length > 20) return raw;
@@ -1160,12 +1135,10 @@ async function decomposeQuery(query: string): Promise<string[]> {
   return variants.length > 0 ? [query, ...variants.slice(0, 3)] : [query];
 }
 
-// ─── Step 5: Context Compression ─────────────────────────────────────────────
+// --- Context Compression
 
-// ─── P6: Context Sufficiency Gate ────────────────────────────────────────────
-// Google ICLR 2025: insufficient context makes hallucination WORSE.
-// If retrieved chunks score below threshold, force abstention instead of
-// feeding irrelevant context that increases model confidence in wrong answers.
+// --- Context Sufficiency Gate
+// Insufficient context worsens hallucination (ICLR 2025). Force abstention below threshold.
 
 type ContextSufficiency = 'SUFFICIENT' | 'LOW' | 'INSUFFICIENT' | 'NO_CONTEXT';
 
@@ -1176,9 +1149,8 @@ function checkContextSufficiency(chunks: string[], avgScore: number): ContextSuf
   return 'SUFFICIENT';
 }
 
-// ─── P13: Negation Handling (code-based, no model) ───────────────────────────
-// 7B models fail at negation. "Which are NOT mentioned" returns the mentioned ones.
-// Fix: detect negation, decompose into positive extraction, compute complement in code.
+// --- Negation Handling (code-based, no model)
+// 7B models fail at negation; detect it and compute complement in code.
 
 const NEGATION_RE = /\b(not|n'?t|never|no|none|neither|nor|except|other than|besides|excluding|without)\b.*\b(mention|include|list|appear|use|contain|have|reference)\b/i;
 
@@ -1186,7 +1158,7 @@ function hasNegation(query: string): boolean {
   return NEGATION_RE.test(query);
 }
 
-// ─── P14: Numerical Query Detection (code computes, not model) ───────────────
+// --- Numerical Query Detection (code computes, not model)
 
 const NUMERICAL_RE = /\b(average|mean|sum|total|count|how many|percentage|ratio|maximum|minimum|max|min|fastest|slowest|highest|lowest)\b/i;
 
@@ -1257,7 +1229,7 @@ function compressChunks(chunks: string[], maxTokens: number, excludeEntities: Se
   return compressed.join('\n\n');
 }
 
-// ─── Step 6: Summary Management ──────────────────────────────────────────────
+// --- Summary Management
 
 async function manageSummary(history: ChatMessage[], intent: ChatIntent, frustrated: boolean): Promise<{ summary: string; recent: ChatMessage[] }> {
   // Wipe rolling summary on topic change or frustration (pinned facts survive)
@@ -1318,12 +1290,9 @@ function buildTwoTierSummary(rollingSummary: string): string {
   return truncTk(parts.join('\n'), TOKEN_BUDGET.summary);
 }
 
-// ─── Step 7: Prompt Assembly & Response Design ──────────────────────────────
-// System prompt: exactly 6 rules, <200 tokens. Each rule prevents a documented failure.
+// --- Prompt Assembly & Response Design
 
-// ─── Chat System Prompt (Q&A focused) ────────────────────────────────────────
-// Designed for conversational Q&A about notes. Answers questions directly,
-// explains relationships, provides evidence. Different from summary prompts.
+// --- Chat System Prompt (Q&A focused)
 const CHAT_SYSTEM = `You are Epito, an AI assistant that answers questions about the user's notes. Rules:
 1. Answer the question directly using information from the provided notes
 2. When mentioning people or organizations, explain their relationship (e.g., "X is affiliated with Y")
@@ -1333,8 +1302,7 @@ const CHAT_SYSTEM = `You are Epito, an AI assistant that answers questions about
 
 const CHAT_GROUNDING = `Answer using only the notes provided. Be specific and explain relationships between entities.`;
 
-// ─── Summary System Prompt (synthesis focused) ───────────────────────────────
-// Used only by the summarization pipeline. Different tone and goal.
+// --- Summary System Prompt (synthesis focused)
 const SUMMARY_SYSTEM = `You are a world-class analyst. Produce comprehensive, insightful summaries that explain the meaning and significance of the content.`;
 
 // Intent-specific prompt additions (one-liner per intent, appended to user query)
@@ -1399,9 +1367,9 @@ function buildMessages(
   return msgs;
 }
 
-// ─── Step 8: Output Validation ───────────────────────────────────────────────
+// --- Output Validation
 
-// ─── Grounding Check (post-generation entity validation) ─────────────────────
+// --- Grounding Check (post-generation entity validation)
 
 function groundingCheck(response: string, context: string): string[] {
   if (!context || !response) return [];
@@ -1475,7 +1443,7 @@ function validateOutput(text: string, query: string, context: string): 'ok' | 'e
   return 'ok';
 }
 
-// ─── Core Pipeline ───────────────────────────────────────────────────────────
+// --- Core Pipeline
 
 function getParams(frustrated: boolean, isCorrection: boolean, intent: ChatIntent) {
   const maxTk = INTENT_MAX_TOKENS[intent] || CHAT_MAX_TOKENS;
@@ -1493,7 +1461,7 @@ async function chatPipeline(
 ): Promise<string> {
   await ensureLlamaRunning();
   await acquireInferenceLock();
-  resetIdleTimer();
+  holdServer();
   const start = Date.now();
 
   try {
@@ -1547,8 +1515,7 @@ async function chatPipeline(
       context = truncTk(rawContext, TOKEN_BUDGET.context);
     }
 
-    // ── Focused Context Extraction ──────────────────────────────────────
-    // Find query terms in chunks and extract surrounding text.
+    // Focused context extraction: find query terms in chunks
     const allChunks = isRAG && chunks ? chunks : context ? [context] : [];
     const extraction = extractFocusedContext(rawQuery, allChunks);
 
@@ -1557,10 +1524,7 @@ async function chatPipeline(
       ? extraction.focusedContext
       : context;
 
-    // ── Entity-Enriched Context Assembly ─────────────────────────────────
-    // Query the entity index to build a relationship graph header.
-    // This gives the model structured entity→entity relationships
-    // BEFORE it sees the raw text, preventing entity relation collapse.
+    // Entity-enriched context: relationship graph header before raw text
     const entityHeader = buildEntityContext(rawQuery);
     if (entityHeader) {
       effectiveContext = `### Entity Relationships\n${entityHeader}\n\n### Note Content\n${effectiveContext}`;
@@ -1637,10 +1601,11 @@ async function chatPipeline(
   } finally {
     recordInferenceTime(Date.now() - start);
     releaseInferenceLock();
+    releaseServer();
   }
 }
 
-// ─── Streaming Pipeline ──────────────────────────────────────────────────────
+// --- Streaming Pipeline
 
 async function* streamPipeline(
   rawContext: string,
@@ -1651,7 +1616,7 @@ async function* streamPipeline(
 ): AsyncGenerator<string> {
   await ensureLlamaRunning();
   await acquireInferenceLock();
-  resetIdleTimer();
+  holdServer();
   const start = Date.now();
 
   try {
@@ -1741,23 +1706,17 @@ async function* streamPipeline(
   } finally {
     recordInferenceTime(Date.now() - start);
     releaseInferenceLock();
+    releaseServer();
   }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-// MSR-RAG Chat Pipeline (Multi-Stage Reasoning Retrieval)
-//
-// Flow: Query Understanding → Stage 1 Retrieval → Reasoning → Stage 2 Retrieval
-//       → Context Assembly → Compression → Answer Synthesis → Verification
-//
-// This pipeline is used ONLY for chat. Summary has its own separate pipeline.
-// ═══════════════════════════════════════════════════════════════════════════════
+// --- MSR-RAG Chat Pipeline (Multi-Stage Reasoning Retrieval)
+// Query Understanding -> Retrieval -> Reasoning -> Targeted Retrieval -> Assembly -> Synthesis -> Verification
 
-import { contextualRetrieveForChat, semanticSearch } from './pipeline';
+import { contextualRetrieveForChat, semanticSearch } from '@/inference/pipeline';
 
-// ─── Step 1: Query Understanding (zero LLM) ─────────────────────────────────
-// Extracts intent, entities, relationship patterns, and question type.
-// Also extracts implicit entity types from the query (e.g. "universities" → ORG).
+// --- Query Understanding (zero LLM)
+// Extracts intent, entities, relationship patterns, question type, and implicit entity types.
 
 type QuestionType = 'entity_lookup' | 'explanation' | 'comparison' | 'list' | 'yes_no' | 'relationship' | 'general';
 
@@ -1801,10 +1760,8 @@ function understandQuery(query: string): {
   return { intent, queryEntities, implicitEntityTypes, questionType, relationshipQuery };
 }
 
-// ─── Step 3: Reasoning — gap analysis on retrieved context ───────────────────
-// Compares query requirements against what stage 1 actually retrieved.
-// Identifies: missing entities, thin context, relationship gaps.
-// Produces targeted follow-up queries for stage 2.
+// --- Reasoning (gap analysis on stage 1 context)
+// Identifies missing entities, thin context, relationship gaps; produces follow-up queries.
 
 function reasonAboutContext(
   query: string,
@@ -1863,11 +1820,8 @@ function reasonAboutContext(
   return { missingEntities, followUpQueries, entityTypeQueries, hasSufficientContext };
 }
 
-// ─── Step 4: Stage 2 Targeted Retrieval ──────────────────────────────────────
-// Three retrieval strategies:
-// 1. Contextual search for follow-up queries (hybrid + RRF)
-// 2. Entity DB index search for missing entity names
-// 3. Entity type search for implicit types (e.g. all ORGs)
+// --- Stage 2 Targeted Retrieval
+// Three strategies: contextual search, entity DB lookup, entity type search.
 
 async function stage2Retrieval(
   sourceId: string | null,
@@ -1929,9 +1883,8 @@ async function stage2Retrieval(
   return newContexts;
 }
 
-// ─── Step 5: Context Assembly ────────────────────────────────────────────────
-// Entity-aware ranking → sentence dedup → token budget enforcement.
-// Scores chunks by: query entity overlap, entity density, relationship presence, source stage.
+// --- Context Assembly
+// Entity-aware ranking, sentence dedup, token budget enforcement.
 
 function assembleContext(
   stage1: string[],
@@ -2013,7 +1966,7 @@ export async function* msrChatStream(
 ): AsyncGenerator<string> {
   await ensureLlamaRunning();
   await acquireInferenceLock();
-  resetIdleTimer();
+  holdServer();
   const start = Date.now();
 
   try {
@@ -2255,6 +2208,7 @@ export async function* msrChatStream(
   } finally {
     recordInferenceTime(Date.now() - start);
     releaseInferenceLock();
+    releaseServer();
   }
 }
 

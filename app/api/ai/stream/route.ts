@@ -6,10 +6,9 @@ import {
   directSummarizeStream,
   msrChatStream,
   cleanInputText,
-} from '@/lib/ai/llm';
-import type { SummaryEvent } from '@/lib/ai/llm';
-import { splitInto100WordChunks, explainSingleChunk } from '@/lib/ai/explain';
-import { canAcceptTask, taskStarted, taskCompleted, isShuttingDown } from '@/lib/lifecycle';
+} from '@/model/llm';
+import { splitInto100WordChunks, explainSingleChunk } from '@/model/explain';
+import { canAcceptTask, taskStarted, taskCompleted, isShuttingDown } from '@/inference/lifecycle';
 
 export const dynamic = 'force-dynamic';
 
@@ -36,7 +35,7 @@ export async function POST(request: NextRequest) {
       headers: { 'Content-Type': 'application/json' },
     });
   }
-  const { action, text, sourceId, chatMessage, chatHistory, sectionText, sectionIndex, totalSections, previousPoints, previousContext, sectionSummaries,
+  const { action, text, sourceId, chatMessage, chatHistory,
     blocks, startIdx, batchSize, previousBlockSummaries, allBlockSummaries } = body;
 
   if (!text?.trim() && action !== 'explain-section' && action !== 'explain-chunk' && action !== 'summarize-batch' && action !== 'summarize-final') {
@@ -54,8 +53,6 @@ export async function POST(request: NextRequest) {
     async start(controller) {
       try {
         if (action === 'summarize') {
-          // Short notes: direct single-call summarization
-          // Long notes: frontend splits into blocks and calls summarize-batch
           const wc = cleaned.split(/\s+/).length;
           if (wc <= 800) {
             for await (const event of directSummarizeStream(cleaned)) {
@@ -66,13 +63,10 @@ export async function POST(request: NextRequest) {
               }
             }
           } else {
-            // Long note: return blocks for the frontend to drive batching
             const noteBlocks = splitNoteIntoBlocks(cleaned);
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ blocks: noteBlocks })}\n\n`));
           }
         } else if (action === 'summarize-batch') {
-          // Process exactly one batch of blocks (3 at a time). Then stop.
-          // Frontend calls this again with the next startIdx after user clicks Continue.
           const gen = summarizeBatchStream(
             blocks || [],
             startIdx || 0,
@@ -97,7 +91,6 @@ export async function POST(request: NextRequest) {
             }
           }
         } else if (action === 'summarize-final') {
-          // Generate the final merged summary from all block summaries
           for await (const event of synthesizeFinalStream(allBlockSummaries || [])) {
             if (event.type === 'progress') {
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({ progress: event.message })}\n\n`));
@@ -106,13 +99,11 @@ export async function POST(request: NextRequest) {
             }
           }
         } else if (action === 'explain') {
-          // Split into 100-word chunks and return to frontend
           const chunks = splitInto100WordChunks(cleaned);
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({
             explainChunks: chunks.map(c => c.text),
           })}\n\n`));
         } else if (action === 'explain-chunk') {
-          // Explain exactly ONE 100-word chunk, then stop.
           const chunkText = body.chunkText || '';
           const chunkIndex = body.chunkIndex || 0;
           const totalChunks = body.totalChunks || 1;
@@ -133,7 +124,6 @@ export async function POST(request: NextRequest) {
             return;
           }
 
-          // MSR-RAG: Multi-Stage Reasoning Retrieval pipeline
           for await (const chunk of msrChatStream(sourceId || null, chatMessage, chatHistory || [])) {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`));
           }
@@ -145,9 +135,14 @@ export async function POST(request: NextRequest) {
       } catch (err) {
         console.error('[API] Stream error:', err);
         const msg = err instanceof Error ? err.message : 'Generation failed';
-        const errorText = msg.includes('ECONNREFUSED') || msg.includes('fetch failed')
-          ? 'Cannot connect to AI engine. It may still be loading.'
-          : msg;
+        let errorText: string;
+        if (msg.includes('ECONNREFUSED') || msg.includes('fetch failed')) {
+          errorText = 'Cannot connect to AI engine. It may still be loading.';
+        } else if (msg.includes('llama-server failed')) {
+          errorText = 'AI engine failed to start. Please restart the application.';
+        } else {
+          errorText = 'AI processing failed. Please try again.';
+        }
         controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: errorText })}\n\n`));
         controller.close();
         taskCompleted();

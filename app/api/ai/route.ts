@@ -1,11 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { summarize, retrieveChunksForSummarization } from '@/lib/ai/pipeline';
+import { summarize, retrieveChunksForSummarization } from '@/inference/pipeline';
 import {
   summarizeText, summarizeChunks, explainText,
   msrChat,
   getModelStatus, cleanInputText, chunkForSummarization, chunkForExplain,
-} from '@/lib/ai/llm';
-import { canAcceptTask, taskStarted, taskCompleted, isShuttingDown } from '@/lib/lifecycle';
+} from '@/model/llm';
+import { canAcceptTask, taskStarted, taskCompleted, isShuttingDown } from '@/inference/lifecycle';
 
 export const dynamic = 'force-dynamic';
 
@@ -101,7 +101,6 @@ export async function POST(request: NextRequest) {
           return NextResponse.json({ error: 'chatMessage required' }, { status: 400 });
         }
 
-        // MSR-RAG: Multi-Stage Reasoning Retrieval pipeline
         const response = await msrChat(sourceId || null, chatMessage, chatHistory || []);
         return NextResponse.json({ response, source: 'msr-rag' });
       }
@@ -123,9 +122,14 @@ export async function POST(request: NextRequest) {
   } catch (err) {
     console.error('[API] AI error:', err);
     const msg = err instanceof Error ? err.message : 'AI processing failed';
-    const errorText = msg.includes('ECONNREFUSED') || msg.includes('fetch failed')
-      ? 'Cannot connect to AI engine. It may still be loading.'
-      : msg;
+    let errorText: string;
+    if (msg.includes('ECONNREFUSED') || msg.includes('fetch failed')) {
+      errorText = 'Cannot connect to AI engine. It may still be loading.';
+    } else if (msg.includes('llama-server failed')) {
+      errorText = 'AI engine failed to start. Please restart the application.';
+    } else {
+      errorText = 'AI processing failed. Please try again.';
+    }
     return NextResponse.json({ error: errorText }, { status: 500 });
   } finally {
     taskCompleted();

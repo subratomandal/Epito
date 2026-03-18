@@ -24,17 +24,28 @@ export async function POST(req: NextRequest) {
       table: { row: { cantSplit: true } },
       footer: true,
       pageNumber: true,
+      page: {
+        size: { width: '210mm', height: '297mm' },
+        margin: { top: '15mm', right: '15mm', bottom: '15mm', left: '15mm' },
+      },
+      font: 'Calibri',
+      fontSize: 22, // half-points: 22 = 11pt
     });
 
     const arrayBuffer = buffer instanceof Buffer
       ? buffer
       : Buffer.from(await (buffer as Blob).arrayBuffer());
 
+    const safeTitle = (title || 'Untitled')
+      .replace(/["\r\n\x00-\x1f]/g, '')
+      .replace(/[/\\?%*:|<>]/g, '-')
+      .slice(0, 100);
+
     return new NextResponse(arrayBuffer, {
       status: 200,
       headers: {
         'Content-Type': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'Content-Disposition': `attachment; filename="${(title || 'Untitled').replace(/"/g, '')}.docx"`,
+        'Content-Disposition': `attachment; filename="${safeTitle}.docx"`,
       },
     });
   } catch (err) {

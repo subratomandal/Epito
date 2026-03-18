@@ -1,14 +1,24 @@
 import { NextResponse } from 'next/server';
-import { closeDb } from '@/lib/database';
+import { closeDb } from '@/notes/database';
 
 export const dynamic = 'force-dynamic';
 
-// Called by Tauri before force-killing the Node.js process.
-// Ensures the database is cleanly closed (WAL flushed, locks released).
-// Only accepts requests from localhost.
+// Graceful shutdown: flush WAL and close database before process exit.
 export async function POST(request: Request) {
-  const host = request.headers.get('host') || '';
-  if (!host.startsWith('127.0.0.1') && !host.startsWith('localhost')) {
+  const origin = request.headers.get('origin') || '';
+  const referer = request.headers.get('referer') || '';
+  const isLocalOrigin =
+    !origin || // server-side fetch (no origin)
+    origin.startsWith('http://127.0.0.1') ||
+    origin.startsWith('http://localhost') ||
+    origin.startsWith('tauri://');
+  const isLocalReferer =
+    !referer ||
+    referer.startsWith('http://127.0.0.1') ||
+    referer.startsWith('http://localhost') ||
+    referer.startsWith('tauri://');
+
+  if (!isLocalOrigin || !isLocalReferer) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 });
   }
 
@@ -18,10 +28,7 @@ export async function POST(request: Request) {
     console.error('[Shutdown] Error closing database:', err);
   }
 
-  // Respond before exiting so the caller gets the 200
   const response = NextResponse.json({ status: 'shutting_down' });
-
-  // Schedule exit after response is sent
   setTimeout(() => process.exit(0), 100);
 
   return response;

@@ -6,16 +6,26 @@ import os from 'os';
 const DATA_DIR = process.env.EPITO_DATA_DIR || path.resolve(process.cwd(), 'data');
 const KEY_PATH = path.join(DATA_DIR, 'encryption.key');
 
+let _cachedKey: Buffer | null = null;
+
 function getEncryptionKey(): Buffer {
+  if (_cachedKey) return _cachedKey;
+
   if (fs.existsSync(KEY_PATH)) {
-    return Buffer.from(fs.readFileSync(KEY_PATH, 'utf8'), 'hex');
+    const hex = fs.readFileSync(KEY_PATH, 'utf8').trim();
+    if (!/^[0-9a-f]{64}$/i.test(hex)) {
+      throw new Error('Corrupted encryption key file');
+    }
+    _cachedKey = Buffer.from(hex, 'hex');
+    return _cachedKey;
   }
   const key = crypto.randomBytes(32);
   fs.mkdirSync(DATA_DIR, { recursive: true });
-  fs.writeFileSync(KEY_PATH, key.toString('hex'));
+  fs.writeFileSync(KEY_PATH, key.toString('hex'), { mode: 0o600 });
   if (os.platform() !== 'win32') {
     fs.chmodSync(KEY_PATH, 0o600);
   }
+  _cachedKey = key;
   return key;
 }
 

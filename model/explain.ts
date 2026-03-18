@@ -1,14 +1,8 @@
-// ═══════════════════════════════════════════════════════════════════════════════
-// Explain Pipeline — Sequential Comprehension Engine
-//
-// Architecture:
-//   Note → split into 100-word chunks → explain ONE at a time → Continue → next
-//
-// This is NOT summarization. Explain = sequential comprehension engine.
-// Fully isolated from chat and summary pipelines.
-// ═══════════════════════════════════════════════════════════════════════════════
+// --- Explain Pipeline
+// Splits notes into 100-word chunks, explains each one sequentially via LLM.
+// Isolated from chat and summary pipelines.
 
-import { cleanInputText } from './llm';
+import { cleanInputText, ensureLlamaRunning } from './llm';
 
 export type ExplainEvent =
   | { type: 'progress'; message: string }
@@ -50,7 +44,7 @@ ${segmentText}
 
 Explanation:`;
 
-// ─── Split into exactly 100-word chunks ──────────────────────────────────────
+// --- Chunking
 
 export interface ExplainChunk {
   text: string;
@@ -72,13 +66,15 @@ export function splitInto100WordChunks(text: string): ExplainChunk[] {
   return chunks;
 }
 
-// ─── Explain exactly ONE chunk (streaming) ───────────────────────────────────
+// --- Single Chunk Explanation (streaming)
 
 export async function* explainSingleChunk(
   chunkText: string,
   index: number,
   total: number,
 ): AsyncGenerator<ExplainEvent> {
+  await ensureLlamaRunning();
+
   yield { type: 'progress', message: `Explaining section ${index + 1} of ${total}...` };
 
   const body = {
@@ -127,7 +123,7 @@ export async function* explainSingleChunk(
     }
   }
 
-  // Clean artifacts
+  // Strip LLM stop-token artifacts
   accumulated = accumulated
     .replace(/<\/s>/g, '')
     .replace(/<\|im_end\|>/g, '')

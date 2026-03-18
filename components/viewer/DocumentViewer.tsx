@@ -6,7 +6,23 @@ import {
   ZoomIn, ZoomOut, Maximize2, Copy, Check, Search,
   ChevronUp, ChevronDown,
 } from 'lucide-react';
-import type { Document, UploadedImage } from '@/lib/types';
+import type { Document, UploadedImage } from '@/common/types';
+
+// OCR text has single \n between words within paragraphs and \n\n for real breaks.
+// Rejoin intra-paragraph lines into flowing text while preserving paragraph breaks.
+function normalizeExtractedText(text: string): string {
+  return text
+    .replace(/(\w)-\n(\w)/g, '$1$2')
+    .replace(/\n{2,}/g, '\x00PARA\x00')
+    .replace(/\n/g, ' ')
+    .replace(/\x00PARA\x00/g, '\n\n')
+    .replace(/ {2,}/g, ' ')
+    .replace(/ *\n\n */g, '\n\n')
+    .split('\n')
+    .map(line => line.trim())
+    .join('\n')
+    .trim();
+}
 
 interface DocumentViewerProps {
   type: 'document' | 'image';
@@ -90,7 +106,8 @@ export default function DocumentViewer({ type, id, onClose, isMobile, onTextChan
   const sentinelRef = useRef<HTMLDivElement>(null);
 
   const copyText = useCallback((textToCopy: string) => {
-    navigator.clipboard.writeText(textToCopy).then(() => {
+    const normalized = normalizeExtractedText(textToCopy);
+    navigator.clipboard.writeText(normalized).then(() => {
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }).catch(() => {});
@@ -334,7 +351,7 @@ export default function DocumentViewer({ type, id, onClose, isMobile, onTextChan
               {paragraphs.slice(0, renderedCount).map((para, i) => {
                 const paraMatches = matchesByPara.get(i);
                 return (
-                  <p key={i} className="text-sm text-foreground/90 leading-relaxed mb-3 virtual-para">
+                  <p key={i} className="text-[15px] text-foreground/90 leading-relaxed mb-3 virtual-para">
                     {paraMatches
                       ? renderHighlightedParagraph(
                           para,
@@ -354,7 +371,7 @@ export default function DocumentViewer({ type, id, onClose, isMobile, onTextChan
               )}
             </div>
           ) : (
-            <p className="text-sm text-muted-foreground italic">
+            <p className="text-[15px] text-muted-foreground italic">
               {status === 'processing' ? 'Text extraction in progress...' : 'No text content extracted'}
             </p>
           )}

@@ -2,9 +2,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { writeFile, mkdir } from 'fs/promises';
 import path from 'path';
 import { randomUUID } from 'crypto';
-import * as db from '@/lib/database';
-import { processDocument, processImage } from '@/lib/ai/pipeline';
-import { ocrImage, ocrPDF, ocrDOCX, preprocessImage } from '@/lib/ocr';
+import * as db from '@/notes/database';
+import { processDocument, processImage } from '@/inference/pipeline';
+import { ocrImage, ocrPDF, ocrDOCX, preprocessImage } from '@/inference/ocr';
 
 export const dynamic = 'force-dynamic';
 

@@ -11,8 +11,8 @@ import StartupScreen from '@/components/startup/StartupScreen';
 import BrandedSplash from '@/components/common/BrandedSplash';
 import { Menu, Lightbulb } from 'lucide-react';
 import { ErrorBoundary } from '@/components/common/ErrorBoundary';
-import type { Note, Document, UploadedImage } from '@/lib/types';
-import { debounce } from '@/lib/utils';
+import type { Note, Document, UploadedImage } from '@/common/types';
+import { debounce } from '@/common/utils';
 
 type ViewState =
   | { mode: 'note' }
@@ -87,7 +87,6 @@ export default function HomePage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ theme: savedTheme }),
       }).catch(() => {});
-      // Match titlebar color to theme on startup
       try {
         const t = (window as any).__TAURI_INTERNALS__;
         if (t?.invoke) t.invoke('set_theme_color', { theme: savedTheme }).catch(() => {});
@@ -373,7 +372,6 @@ export default function HomePage() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ theme: newTheme }),
     }).catch(() => {});
-    // Update titlebar color to match theme (Tauri transparent titlebar)
     try {
       const t = (window as any).__TAURI_INTERNALS__;
       if (t?.invoke) t.invoke('set_theme_color', { theme: newTheme }).catch(() => {});

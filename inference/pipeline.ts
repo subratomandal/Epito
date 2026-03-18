@@ -1,10 +1,10 @@
 import { randomUUID } from 'crypto';
-import * as db from '@/lib/database';
-import { generateEmbedding, initEmbeddings, EMBEDDING_DIM } from './embeddings';
-import { VectorIndex, cosineSimilarity } from './vector';
-import { cleanInputText } from './llm';
-import type { Note, SearchResult, RelatedNote, Topic, AISummary, SourceType, ContextualMatch, ChatRetrievalResult } from '@/lib/types';
-import { stripHtml } from '@/lib/utils';
+import * as db from '@/notes/database';
+import { generateEmbedding, initEmbeddings, EMBEDDING_DIM } from '@/memory/embeddings';
+import { VectorIndex, cosineSimilarity } from '@/memory/vector';
+import { cleanInputText } from '@/model/llm';
+import type { Note, SearchResult, RelatedNote, Topic, AISummary, SourceType, ContextualMatch, ChatRetrievalResult } from '@/common/types';
+import { stripHtml } from '@/common/utils';
 
 const chunkIndex = new VectorIndex(EMBEDDING_DIM);
 const noteIndex = new VectorIndex(EMBEDDING_DIM);
@@ -37,16 +37,14 @@ function splitSentences(text: string): string[] {
   return raw.map(s => s.trim()).filter(s => s.length > 0);
 }
 
-// ─── P24: Frontmatter Stripping ──────────────────────────────────────────────
-// Markdown frontmatter (---\nyaml\n---) causes parse errors. Strip before chunking.
+// --- Frontmatter Stripping
 
 function stripFrontmatter(text: string): string {
   return text.replace(/^---\s*\n[\s\S]*?\n---\s*\n/, '').trim();
 }
 
-// ─── Structure-Aware Pre-Processing ──────────────────────────────────────────
-// Extracts code blocks, tables, and lists BEFORE sentence splitting.
-// These are preserved as single chunks and never split mid-structure.
+// --- Structure-Aware Pre-Processing
+// Extracts code blocks and tables before sentence splitting; preserved as single chunks.
 
 interface StructuredBlock {
   type: 'prose' | 'code' | 'table';
@@ -120,10 +118,7 @@ function chunkText(text: string): { content: string; startOffset: number; endOff
       continue;
     }
 
-    // ── Paragraph-Aware Chunking ──────────────────────────────────────
-    // Split on paragraph boundaries FIRST to preserve entity relationships.
-    // Then merge small paragraphs and split oversized ones by sentence.
-    // This prevents entity relation collapse across chunk boundaries.
+    // Split on paragraph boundaries first to preserve entity relationships.
     const paragraphs = block.content.split(/\n\s*\n/).filter(p => p.trim().length > 0);
 
     let currentParagraphs: string[] = [];
@@ -226,7 +221,7 @@ function chunkText(text: string): { content: string; startOffset: number; endOff
   return allChunks.length > 0 ? allChunks : [{ content: cleaned, startOffset: 0, endOffset: cleaned.length }];
 }
 
-// ─── Entity Extraction (runs during ingestion, stored in DB) ─────────────────
+// --- Entity Extraction
 
 const ENTITY_EXTRACTORS: { type: string; patterns: RegExp[] }[] = [
   {
@@ -841,9 +836,7 @@ interface RetrievalCandidate {
   combinedScore: number;
 }
 
-// ─── BM25-style keyword scoring ──────────────────────────────────────────────
-// Proper term frequency scoring normalized by document length,
-// replacing simple substring matching that missed paraphrased content.
+// --- BM25-style keyword scoring (TF normalized by document length)
 
 function bm25Score(content: string, terms: string[], k1 = 1.2, b = 0.75, avgDl = 200): number {
   const words = content.toLowerCase().split(/\s+/);
@@ -912,11 +905,7 @@ async function hybridRetrieve(
     }
   }
 
-  // ── Reciprocal Rank Fusion (RRF) ─────────────────────────────────────
-  // Instead of weighted average (0.6*sem + 0.4*kw) which collapses when
-  // one signal is weak, RRF combines RANK positions from each method.
-  // Formula: RRF(d) = Σ 1/(k + rank_i(d)) for each ranking method
-  // k=60 is standard (Cormack et al., used in production by Elasticsearch, Vespa)
+  // Reciprocal Rank Fusion: combine rank positions instead of raw scores (k=60 standard)
   const RRF_K = 60;
 
   // Rank by semantic score
@@ -993,10 +982,7 @@ function rerankChunks(
   return candidates.slice(0, topK);
 }
 
-// ─── MMR Reranking (Maximal Marginal Relevance) ─────────────────────────────
-// After initial hybrid retrieval + TF-IDF rerank, apply MMR to enforce diversity.
-// Penalizes candidates that are too similar to already-selected chunks.
-// This prevents top-K from being dominated by chunks from the same section.
+// --- MMR Reranking: penalize candidates too similar to already-selected chunks for diversity
 
 async function mmrRerank(
   candidates: RetrievalCandidate[],
@@ -1050,9 +1036,7 @@ async function mmrRerank(
   return selected;
 }
 
-// ─── Adjacent Chunk Expansion ────────────────────────────────────────────────
-// When chunk N is retrieved, also include chunks N-1 and N+1 from the same
-// source to handle answers that span chunk boundaries.
+// --- Adjacent Chunk Expansion: include N-1 and N+1 to handle boundary-spanning answers
 
 function expandWithAdjacentChunks(
   selected: RetrievalCandidate[],

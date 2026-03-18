@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import * as db from '@/lib/database';
-import { processNote } from '@/lib/ai/pipeline';
-import { stripHtml } from '@/lib/utils';
+import * as db from '@/notes/database';
+import { processNote } from '@/inference/pipeline';
+import { stripHtml } from '@/common/utils';
 
 export const dynamic = 'force-dynamic';
 

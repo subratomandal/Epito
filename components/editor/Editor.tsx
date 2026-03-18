@@ -28,8 +28,8 @@ import {
   Download, FileImage, FileType,
   AlignLeft, AlignCenter, AlignRight,
 } from 'lucide-react';
-import { exportAsPDF, exportAsDOCX, exportAsImage } from '@/lib/export';
-import type { ExportFormat } from '@/lib/export';
+import { exportAsPDF, exportAsDOCX, exportAsImage, preloadExportLibs } from '@/inference/export';
+import type { ExportFormat } from '@/inference/export';
 
 const lowlight = createLowlight(common);
 
@@ -43,7 +43,7 @@ const SEARCH_DEBOUNCE = 250;
 const SEARCH_MAX_MATCHES = 500;
 
 const FONT_SIZE_KEY = 'epito-editor-font-size';
-const FONT_SIZE_DEFAULT = 16;
+const FONT_SIZE_DEFAULT = 15;
 const FONT_SIZE_MIN = 10;
 const FONT_SIZE_MAX = 28;
 const FONT_SIZE_STEP = 1;
@@ -273,7 +273,27 @@ function transformPastedHTMLPipeline(html: string): string {
 }
 
 function truncateLargePasteText(text: string): string {
-  return text.length > PASTE_TEXT_MAX ? text.slice(0, PASTE_TEXT_MAX) : text;
+  let t = text.length > PASTE_TEXT_MAX ? text.slice(0, PASTE_TEXT_MAX) : text;
+
+  // Detect OCR-like text (mostly short lines) and rejoin into flowing paragraphs
+  const lines = t.split('\n');
+  if (lines.length > 3) {
+    const shortLines = lines.filter(l => l.trim().length > 0 && l.trim().length < 60).length;
+    const totalNonEmpty = lines.filter(l => l.trim().length > 0).length;
+    if (totalNonEmpty > 0 && shortLines / totalNonEmpty > 0.6) {
+      t = t
+        .replace(/(\w)-\n(\w)/g, '$1$2')
+        .replace(/\n{2,}/g, '\x00PARA\x00')
+        .replace(/\n/g, ' ')
+        .replace(/\x00PARA\x00/g, '\n\n')
+        .replace(/ {2,}/g, ' ')
+        .replace(/ *\n\n */g, '\n\n')
+        .split('\n').map(l => l.trim()).join('\n')
+        .trim();
+    }
+  }
+
+  return t;
 }
 
 export interface NoteEditorHandle {
@@ -407,7 +427,13 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
         return;
       }
 
+      // Skip replacement if editor already has this content — avoids destroying
+      // cursor position, undo history, and racing with user input on save roundtrips.
       if (content !== loadedContentRef.current) {
+        if (editor.getHTML() === content) {
+          loadedContentRef.current = content;
+          return;
+        }
         const { from, to } = editor.state.selection;
         editor.commands.setContent(content);
         loadedContentRef.current = content;
@@ -636,87 +662,20 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
         </div>
 
         {editor && (
-          <div className={cn(
-            'flex items-center gap-0.5 py-2 border-b border-border overflow-x-auto',
-            isMobile ? 'px-3' : 'px-8 flex-wrap',
-          )}>
-            <ToolBtn onClick={() => editor.chain().focus().toggleBold().run()} active={editor.isActive('bold')} title={`Bold (${MOD}+B)`}><Bold size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleItalic().run()} active={editor.isActive('italic')} title={`Italic (${MOD}+I)`}><Italic size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleMark('underline').run()} active={editor.isActive('underline')} title={`Underline (${MOD}+U)`}><UnderlineIcon size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleStrike().run()} active={editor.isActive('strike')} title={`Strikethrough (${MOD}+Shift+X)`}><Strikethrough size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleCode().run()} active={editor.isActive('code')} title={`Inline code (${MOD}+E)`}><Code size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleHighlight().run()} active={editor.isActive('highlight')} title="Highlight"><Highlighter size={14} /></ToolBtn>
-            <div className="w-px h-5 bg-border mx-1 shrink-0" />
-            <ToolBtn onClick={() => editor.chain().focus().setTextAlign('left').run()} active={editor.isActive({ textAlign: 'left' })} title="Align left"><AlignLeft size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().setTextAlign('center').run()} active={editor.isActive({ textAlign: 'center' })} title="Align center"><AlignCenter size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().setTextAlign('right').run()} active={editor.isActive({ textAlign: 'right' })} title="Align right"><AlignRight size={14} /></ToolBtn>
-            <div className="w-px h-5 bg-border mx-1 shrink-0" />
-            <ToolBtn onClick={() => editor.chain().focus().toggleHeading({ level: 1 }).run()} active={editor.isActive('heading', { level: 1 })} title={`Heading 1 (${MOD}+${ALT}+1)`}><Heading1 size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleHeading({ level: 2 }).run()} active={editor.isActive('heading', { level: 2 })} title={`Heading 2 (${MOD}+${ALT}+2)`}><Heading2 size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleHeading({ level: 3 }).run()} active={editor.isActive('heading', { level: 3 })} title={`Heading 3 (${MOD}+${ALT}+3)`}><Heading3 size={14} /></ToolBtn>
-            <div className="w-px h-5 bg-border mx-1 shrink-0" />
-            <ToolBtn onClick={() => editor.chain().focus().toggleBulletList().run()} active={editor.isActive('bulletList')} title={`Bullet list (${MOD}+Shift+8)`}><List size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleOrderedList().run()} active={editor.isActive('orderedList')} title={`Numbered list (${MOD}+Shift+7)`}><ListOrdered size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleTaskList().run()} active={editor.isActive('taskList')} title="Task list"><CheckSquare size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleBlockquote().run()} active={editor.isActive('blockquote')} title={`Quote (${MOD}+Shift+B)`}><Quote size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().setHorizontalRule().run()} active={false} title="Horizontal rule"><Minus size={14} /></ToolBtn>
-            <ToolBtn onClick={() => editor.chain().focus().toggleCodeBlock().run()} active={editor.isActive('codeBlock')} title={`Code block (${MOD}+${ALT}+C)`}><Code size={14} /></ToolBtn>
-            <div className="w-px h-5 bg-border mx-1 shrink-0" />
-            <button
-              onMouseDown={(e) => { e.preventDefault(); toggleSearch(); }}
-              className={cn(
-                'flex items-center gap-1 px-2 py-1.5 rounded-md text-sm transition-colors shrink-0',
-                searchOpen ? 'text-primary bg-primary/10' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
-              )}
-              title="Search in note"
-            >
-              <Search size={14} />
-            </button>
-            <button
-              onMouseDown={(e) => { e.preventDefault(); copyPlainText(); }}
-              className={cn(
-                'flex items-center gap-1 px-2 py-1.5 rounded-md text-sm transition-colors shrink-0',
-                copied ? 'text-green-500 bg-green-500/10' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
-              )}
-              title={copied ? 'Copied!' : 'Copy text'}
-            >
-              {copied ? <Check size={14} /> : <Copy size={14} />}
-            </button>
-            <button
-              onMouseDown={(e) => { e.preventDefault(); setExportOpen(prev => !prev); setExportError(null); }}
-              className={cn(
-                'flex items-center gap-1 px-2 py-1.5 rounded-md text-sm transition-colors shrink-0',
-                exportOpen ? 'text-primary bg-primary/10' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
-              )}
-              title="Export / Save As"
-            >
-              <Download size={14} />
-            </button>
-            <div className="w-px h-5 bg-border mx-1 shrink-0" />
-            <button
-              onMouseDown={(e) => { e.preventDefault(); changeFontSize(-FONT_SIZE_STEP); }}
-              disabled={fontSize <= FONT_SIZE_MIN}
-              className="flex items-center px-1.5 py-1.5 rounded-md text-sm transition-colors shrink-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
-              title="Decrease font size (Cmd/Ctrl + −)"
-            >
-              <AArrowDown size={14} />
-            </button>
-            <button
-              onMouseDown={(e) => { e.preventDefault(); resetFontSize(); }}
-              className="flex items-center px-1 py-1.5 rounded-md text-[10px] font-mono transition-colors shrink-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-              title="Reset font size (Cmd/Ctrl + 0)"
-            >
-              {fontSize}
-            </button>
-            <button
-              onMouseDown={(e) => { e.preventDefault(); changeFontSize(FONT_SIZE_STEP); }}
-              disabled={fontSize >= FONT_SIZE_MAX}
-              className="flex items-center px-1.5 py-1.5 rounded-md text-sm transition-colors shrink-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
-              title="Increase font size (Cmd/Ctrl + +)"
-            >
-              <AArrowUp size={14} />
-            </button>
-          </div>
+          <EditorToolbar
+            editor={editor}
+            searchOpen={searchOpen}
+            toggleSearch={toggleSearch}
+            copied={copied}
+            copyPlainText={copyPlainText}
+            exportOpen={exportOpen}
+            setExportOpen={setExportOpen}
+            setExportError={setExportError}
+            fontSize={fontSize}
+            changeFontSize={changeFontSize}
+            resetFontSize={resetFontSize}
+            isMobile={isMobile}
+          />
         )}
 
         {searchOpen && (
@@ -839,22 +798,163 @@ const NoteEditor = forwardRef<NoteEditorHandle, NoteEditorProps>(
 
 export default NoteEditor;
 
+// Toolbar — prevents 20+ button re-renders per keystroke
+
+interface EditorToolbarProps {
+  editor: ReturnType<typeof useEditor> & {};
+  searchOpen: boolean;
+  toggleSearch: () => void;
+  copied: boolean;
+  copyPlainText: () => void;
+  exportOpen: boolean;
+  setExportOpen: React.Dispatch<React.SetStateAction<boolean>>;
+  setExportError: React.Dispatch<React.SetStateAction<string | null>>;
+  fontSize: number;
+  changeFontSize: (delta: number) => void;
+  resetFontSize: () => void;
+  isMobile?: boolean;
+}
+
+const EditorToolbar = memo(function EditorToolbar({
+  editor, searchOpen, toggleSearch, copied, copyPlainText,
+  exportOpen, setExportOpen, setExportError,
+  fontSize, changeFontSize, resetFontSize, isMobile,
+}: EditorToolbarProps) {
+  const editorRef = useRef(editor);
+  editorRef.current = editor;
+
+  // Stable dispatcher ref — lets memo'd ToolBtns skip re-renders
+  const exec = useCallback((cmd: string) => {
+    const e = editorRef.current;
+    if (!e) return;
+    switch (cmd) {
+      case 'bold': e.chain().focus().toggleBold().run(); break;
+      case 'italic': e.chain().focus().toggleItalic().run(); break;
+      case 'underline': e.chain().focus().toggleMark('underline').run(); break;
+      case 'strike': e.chain().focus().toggleStrike().run(); break;
+      case 'code': e.chain().focus().toggleCode().run(); break;
+      case 'highlight': e.chain().focus().toggleHighlight().run(); break;
+      case 'align-left': e.chain().focus().setTextAlign('left').run(); break;
+      case 'align-center': e.chain().focus().setTextAlign('center').run(); break;
+      case 'align-right': e.chain().focus().setTextAlign('right').run(); break;
+      case 'h1': e.chain().focus().toggleHeading({ level: 1 }).run(); break;
+      case 'h2': e.chain().focus().toggleHeading({ level: 2 }).run(); break;
+      case 'h3': e.chain().focus().toggleHeading({ level: 3 }).run(); break;
+      case 'bullet': e.chain().focus().toggleBulletList().run(); break;
+      case 'ordered': e.chain().focus().toggleOrderedList().run(); break;
+      case 'task': e.chain().focus().toggleTaskList().run(); break;
+      case 'quote': e.chain().focus().toggleBlockquote().run(); break;
+      case 'hr': e.chain().focus().setHorizontalRule().run(); break;
+      case 'codeblock': e.chain().focus().toggleCodeBlock().run(); break;
+    }
+  }, []);
+
+  return (
+    <div className={cn(
+      'flex items-center gap-0.5 py-2 border-b border-border overflow-x-auto',
+      isMobile ? 'px-3' : 'px-8 flex-wrap',
+    )}>
+      <ToolBtn cmd="bold" exec={exec} active={editor.isActive('bold')} title={`Bold (${MOD}+B)`}><Bold size={14} /></ToolBtn>
+      <ToolBtn cmd="italic" exec={exec} active={editor.isActive('italic')} title={`Italic (${MOD}+I)`}><Italic size={14} /></ToolBtn>
+      <ToolBtn cmd="underline" exec={exec} active={editor.isActive('underline')} title={`Underline (${MOD}+U)`}><UnderlineIcon size={14} /></ToolBtn>
+      <ToolBtn cmd="strike" exec={exec} active={editor.isActive('strike')} title={`Strikethrough (${MOD}+Shift+X)`}><Strikethrough size={14} /></ToolBtn>
+      <ToolBtn cmd="code" exec={exec} active={editor.isActive('code')} title={`Inline code (${MOD}+E)`}><Code size={14} /></ToolBtn>
+      <ToolBtn cmd="highlight" exec={exec} active={editor.isActive('highlight')} title="Highlight"><Highlighter size={14} /></ToolBtn>
+      <div className="w-px h-5 bg-border mx-1 shrink-0" />
+      <ToolBtn cmd="align-left" exec={exec} active={editor.isActive({ textAlign: 'left' })} title="Align left"><AlignLeft size={14} /></ToolBtn>
+      <ToolBtn cmd="align-center" exec={exec} active={editor.isActive({ textAlign: 'center' })} title="Align center"><AlignCenter size={14} /></ToolBtn>
+      <ToolBtn cmd="align-right" exec={exec} active={editor.isActive({ textAlign: 'right' })} title="Align right"><AlignRight size={14} /></ToolBtn>
+      <div className="w-px h-5 bg-border mx-1 shrink-0" />
+      <ToolBtn cmd="h1" exec={exec} active={editor.isActive('heading', { level: 1 })} title={`Heading 1 (${MOD}+${ALT}+1)`}><Heading1 size={14} /></ToolBtn>
+      <ToolBtn cmd="h2" exec={exec} active={editor.isActive('heading', { level: 2 })} title={`Heading 2 (${MOD}+${ALT}+2)`}><Heading2 size={14} /></ToolBtn>
+      <ToolBtn cmd="h3" exec={exec} active={editor.isActive('heading', { level: 3 })} title={`Heading 3 (${MOD}+${ALT}+3)`}><Heading3 size={14} /></ToolBtn>
+      <div className="w-px h-5 bg-border mx-1 shrink-0" />
+      <ToolBtn cmd="bullet" exec={exec} active={editor.isActive('bulletList')} title={`Bullet list (${MOD}+Shift+8)`}><List size={14} /></ToolBtn>
+      <ToolBtn cmd="ordered" exec={exec} active={editor.isActive('orderedList')} title={`Numbered list (${MOD}+Shift+7)`}><ListOrdered size={14} /></ToolBtn>
+      <ToolBtn cmd="task" exec={exec} active={editor.isActive('taskList')} title="Task list"><CheckSquare size={14} /></ToolBtn>
+      <ToolBtn cmd="quote" exec={exec} active={editor.isActive('blockquote')} title={`Quote (${MOD}+Shift+B)`}><Quote size={14} /></ToolBtn>
+      <ToolBtn cmd="hr" exec={exec} active={false} title="Horizontal rule"><Minus size={14} /></ToolBtn>
+      <ToolBtn cmd="codeblock" exec={exec} active={editor.isActive('codeBlock')} title={`Code block (${MOD}+${ALT}+C)`}><Code size={14} /></ToolBtn>
+      <div className="w-px h-5 bg-border mx-1 shrink-0" />
+      <button
+        onMouseDown={(e) => { e.preventDefault(); toggleSearch(); }}
+        className={cn(
+          'flex items-center gap-1 px-2 py-1.5 rounded-md text-sm shrink-0',
+          searchOpen ? 'text-primary bg-primary/10' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
+        )}
+        title="Search in note"
+      >
+        <Search size={14} />
+      </button>
+      <button
+        onMouseDown={(e) => { e.preventDefault(); copyPlainText(); }}
+        className={cn(
+          'flex items-center gap-1 px-2 py-1.5 rounded-md text-sm shrink-0',
+          copied ? 'text-green-500 bg-green-500/10' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
+        )}
+        title={copied ? 'Copied!' : 'Copy text'}
+      >
+        {copied ? <Check size={14} /> : <Copy size={14} />}
+      </button>
+      <button
+        onMouseDown={(e) => { e.preventDefault(); preloadExportLibs(); setExportOpen(prev => !prev); setExportError(null); }}
+        className={cn(
+          'flex items-center gap-1 px-2 py-1.5 rounded-md text-sm shrink-0',
+          exportOpen ? 'text-primary bg-primary/10' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
+        )}
+        title="Export / Save As"
+      >
+        <Download size={14} />
+      </button>
+      <div className="w-px h-5 bg-border mx-1 shrink-0" />
+      <button
+        onMouseDown={(e) => { e.preventDefault(); changeFontSize(-FONT_SIZE_STEP); }}
+        disabled={fontSize <= FONT_SIZE_MIN}
+        className="flex items-center px-1.5 py-1.5 rounded-md text-sm shrink-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
+        title="Decrease font size (Cmd/Ctrl + −)"
+      >
+        <AArrowDown size={14} />
+      </button>
+      <button
+        onMouseDown={(e) => { e.preventDefault(); resetFontSize(); }}
+        className="flex items-center px-1 py-1.5 rounded-md text-[10px] font-mono shrink-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+        title="Reset font size (Cmd/Ctrl + 0)"
+      >
+        {fontSize}
+      </button>
+      <button
+        onMouseDown={(e) => { e.preventDefault(); changeFontSize(FONT_SIZE_STEP); }}
+        disabled={fontSize >= FONT_SIZE_MAX}
+        className="flex items-center px-1.5 py-1.5 rounded-md text-sm shrink-0 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-30"
+        title="Increase font size (Cmd/Ctrl + +)"
+      >
+        <AArrowUp size={14} />
+      </button>
+    </div>
+  );
+});
+
+// ToolBtn — uses cmd string + stable exec ref so memo actually skips re-renders
+
 const ToolBtn = memo(function ToolBtn(
-  { onClick, active, children, title }: { onClick: () => void; active: boolean; children: React.ReactNode; title?: string },
+  { cmd, exec, active, children, title }: {
+    cmd: string; exec: (cmd: string) => void;
+    active: boolean; children: React.ReactNode; title?: string;
+  },
 ) {
   return (
     <button
-      onMouseDown={(e) => { e.preventDefault(); onClick(); }}
+      onMouseDown={(e) => { e.preventDefault(); exec(cmd); }}
       title={title}
       className={cn(
-        'flex items-center gap-1 px-2 py-1.5 rounded-md text-sm transition-colors shrink-0',
+        'flex items-center gap-1 px-2 py-1.5 rounded-md text-sm shrink-0',
         active ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:bg-accent hover:text-accent-foreground',
       )}
     >
       {children}
     </button>
   );
-});
+}, (prev, next) => prev.active === next.active && prev.cmd === next.cmd);
 
 function cn(...classes: (string | boolean | undefined)[]) {
   return classes.filter(Boolean).join(' ');

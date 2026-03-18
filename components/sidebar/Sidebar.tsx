@@ -9,9 +9,7 @@ import {
   GripVertical, ChevronDown, ChevronRight, RotateCcw, Settings,
   Sun, Moon, Check,
 } from 'lucide-react';
-import type { Note, Document, UploadedImage } from '@/lib/types';
-
-const ORDER_SETTING_KEY = 'note-order';
+import type { Note, Document, UploadedImage } from '@/common/types';
 
 interface SidebarProps {
   notes: Note[];
@@ -62,7 +60,7 @@ export default function Sidebar({
   const [noteOrder, setNoteOrder] = useState<string[]>([]);
   const orderLoadedRef = useRef(false);
 
-  // Load persisted order from server database (survives port changes, app restarts)
+  // Server-persisted order survives port changes and app restarts
   useEffect(() => {
     fetch('/api/settings?key=note-order')
       .then(r => r.ok ? r.json() : { value: null })
@@ -75,7 +73,7 @@ export default function Sidebar({
       .catch(() => { orderLoadedRef.current = true; });
   }, []);
 
-  // Save order to server when it changes (skip the initial load)
+  // Persist order changes (skip initial load)
   useEffect(() => {
     if (!orderLoadedRef.current || noteOrder.length === 0) return;
     fetch('/api/settings', {

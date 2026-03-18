@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
-import * as db from '@/lib/database';
-import { installShutdownHandlers } from '@/lib/lifecycle';
+import * as db from '@/notes/database';
+import { installShutdownHandlers } from '@/inference/lifecycle';
 
 export const dynamic = 'force-dynamic';
 
@@ -18,8 +18,7 @@ export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
   const isReadinessProbe = searchParams.get('ready') !== null;
 
-  // Lightweight readiness probe: returns 200 without touching DB/native modules.
-  // Used by Tauri to know the HTTP server is up before navigating the window.
+  // Readiness probe: returns 200 without touching DB
   if (isReadinessProbe) {
     return NextResponse.json({
       status: 'ok',

@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
-import { getModelStatus, checkLlamaConnection } from '@/lib/ai/llm';
-import { isReady as isEmbeddingReady } from '@/lib/ai/embeddings';
-import { getOCREngine } from '@/lib/ocr';
+import { getModelStatus, checkLlamaConnection } from '@/model/llm';
+import { isReady as isEmbeddingReady } from '@/memory/embeddings';
+import { getOCREngine } from '@/inference/ocr';
 
 export const dynamic = 'force-dynamic';
 

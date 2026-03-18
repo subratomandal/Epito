@@ -145,8 +145,7 @@ async fn do_download(
     };
 
     use tokio::io::AsyncWriteExt;
-    // If we requested a resume but the server sent 200 (full content) instead of 206,
-    // we must start from scratch — don't append to the existing partial file.
+    // Server returned 200 instead of 206 — must restart, not append
     let actual_resume = if resume_from > 0 && response.status().as_u16() != 206 {
         log::info!("Server returned 200 instead of 206 — restarting download from scratch");
         0

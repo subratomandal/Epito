@@ -3,8 +3,8 @@ import { createHash } from 'crypto';
 import {
   getChunkCache, upsertChunkCache, updateChunkCacheSummary,
   updateChunkCacheExplanation, clearChunkCache, pruneStaleChunkCache,
-} from '@/lib/database';
-import { chunkByWords, chunkForExplain, cleanInputText } from '@/lib/ai/llm';
+} from '@/notes/database';
+import { chunkByWords, chunkForExplain, cleanInputText } from '@/model/llm';
 
 export const dynamic = 'force-dynamic';
 
