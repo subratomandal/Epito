@@ -33,50 +33,6 @@ Supported Content:
   <img src="https://raw.githubusercontent.com/subratomandal/Epito/main/assets/searchh.png" alt="Epito image OCR viewer with AI summary panel" />
 </p>
 
-
- ### Architecture
-
-  ```mermaid
-  flowchart TD
-      User["User"] --> Desktop["Epito Desktop App"]
-
-      subgraph DesktopLayer["Desktop Runtime"]
-          Desktop --> Tauri["Tauri WebView"]
-          Desktop --> Rust["Rust Controller"]
-          Rust --> Node["Bundled Node.js Server"]
-          Rust --> LlamaProc["llama-server Process"]
-          Rust --> ModelDL["Model Download Manager"]
-      end
-
-      subgraph AppLayer["Application Layer"]
-          Tauri --> UI["React + Tailwind UI"]
-          UI --> Editor["TipTap Note Editor"]
-          UI --> Viewer["Document / Image Viewer"]
-          UI --> Insights["AI Insights Panel"]
-          UI --> API["Next.js API Routes"]
-      end
-
-      subgraph DataLayer["Local Data Layer"]
-          API --> SQLite[("SQLite Database")]
-          API --> Uploads["Uploaded Files"]
-          API --> Settings["Settings + Theme"]
-          API --> Cache["Chunk / AI Cache"]
-      end
-
-      subgraph IntelligenceLayer["Local Intelligence"]
-          API --> OCR["OCR + Text Extraction"]
-          API --> Embeddings["MiniLM Embeddings"]
-          Embeddings --> Vector["Vector Search Index"]
-          API --> LlamaProc
-          LlamaProc --> Model["Mistral 7B GGUF"]
-      end
-
-      OCR --> SQLite
-      Vector --> API
-      ModelDL --> Model
-  ```
-
-
 ### Privacy And Security Features
 
 1. Local-first storage: Notes, uploads, embeddings, settings, and caches are stored in SQLite and local files.
